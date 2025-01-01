@@ -43,7 +43,20 @@ struct ContentView: View {
             return days[weekday - 1]
         }
         
+        // Add logging function with timestamp
+        private func log(_ message: String) {
+            let timestamp = formatDate(Date())
+            print("[\(timestamp)] \(message)")
+        }
+        
         init() {
+            loadAlarms()
+        }
+        
+        // Add function to force notification status refresh
+        func refreshNotificationStatus() {
+            // Force refresh by clearing last known state
+            self.lastPendingNotifications = nil
             loadAlarms()
         }
         
@@ -54,6 +67,119 @@ struct ContentView: View {
                 
                 // Get pending notifications to cross-reference
                 UNUserNotificationCenter.current().getPendingNotificationRequests { requests in
+                    // Clean up orphaned notifications
+                    let validAlarmIds = Set(self.alarms.map { $0.id.uuidString })
+                    
+                    // Group all notifications by alarm ID
+                    let notificationsByAlarm = Dictionary(grouping: requests) { request -> String in
+                        request.content.userInfo["alarmId"] as? String ?? "unknown"
+                    }
+                    
+                    // Find orphaned notifications
+                    let orphanedNotifications = requests.filter { request in
+                        guard let alarmId = request.content.userInfo["alarmId"] as? String else {
+                            return true // Remove notifications without alarmId
+                        }
+                        return !validAlarmIds.contains(alarmId)
+                    }
+                    
+                    // Find notifications that don't match current alarm settings
+                    var invalidNotifications: [(notification: UNNotificationRequest, reason: String)] = []
+                    
+                    for (alarmId, notifications) in notificationsByAlarm {
+                        guard let alarm = self.alarms.first(where: { $0.id.uuidString == alarmId }) else {
+                            continue // Already handled by orphaned notifications
+                        }
+                        
+                        for notification in notifications {
+                            // Check if it's a snooze notification
+                            if notification.identifier.starts(with: "snooze-") {
+                                if alarm.snoozedUntil == nil {
+                                    invalidNotifications.append((notification, "Snooze notification exists but alarm is not snoozed"))
+                                }
+                                continue
+                            }
+                            
+                            // Check regular alarm notifications
+                            guard let trigger = notification.trigger as? UNCalendarNotificationTrigger,
+                                  let weekday = trigger.dateComponents.weekday else {
+                                invalidNotifications.append((notification, "Invalid trigger type or missing weekday"))
+                                continue
+                            }
+                            
+                            // Verify the weekday is still selected for this alarm
+                            if !alarm.days.contains(weekday) {
+                                invalidNotifications.append((notification, "Notification exists for unselected day \(Self.dayName(weekday))"))
+                            }
+                            
+                            // Verify the time matches
+                            let alarmHour = Calendar.current.component(.hour, from: alarm.time)
+                            let alarmMinute = Calendar.current.component(.minute, from: alarm.time)
+                            if trigger.dateComponents.hour != alarmHour || trigger.dateComponents.minute != alarmMinute {
+                                invalidNotifications.append((notification, "Time mismatch - notification: \(trigger.dateComponents.hour ?? 0):\(trigger.dateComponents.minute ?? 0), alarm: \(alarmHour):\(alarmMinute)"))
+                            }
+                        }
+                    }
+                    
+                    // Remove invalid notifications
+                    if !invalidNotifications.isEmpty {
+                        self.log("\n=== CLEANING UP INVALID NOTIFICATIONS ===")
+                        self.log("Found \(invalidNotifications.count) invalid notifications")
+                        
+                        let identifiersToRemove = invalidNotifications.map { $0.notification.identifier }
+                        UNUserNotificationCenter.current().removePendingNotificationRequests(
+                            withIdentifiers: identifiersToRemove
+                        )
+                        
+                        // Print details of removed notifications
+                        for (notification, reason) in invalidNotifications {
+                            self.log("\nRemoved notification:")
+                            self.log("ID: \(notification.identifier)")
+                            self.log("Alarm ID: \(notification.content.userInfo["alarmId"] as? String ?? "unknown")")
+                            self.log("Title: \(notification.content.title)")
+                            self.log("Reason: \(reason)")
+                            if let trigger = notification.trigger as? UNCalendarNotificationTrigger,
+                               let nextTrigger = trigger.nextTriggerDate() {
+                                self.log("Next trigger: \(self.formatDate(nextTrigger))")
+                            }
+                        }
+                        self.log("-----------------------------")
+                        
+                        // Reschedule notifications for affected alarms
+                        let affectedAlarmIds = Set(invalidNotifications.compactMap { 
+                            $0.notification.content.userInfo["alarmId"] as? String 
+                        })
+                        for alarmId in affectedAlarmIds {
+                            if let alarm = self.alarms.first(where: { $0.id.uuidString == alarmId }) {
+                                self.scheduleAlarm(alarm)
+                            }
+                        }
+                    }
+                    
+                    // Handle orphaned notifications (existing code)
+                    if !orphanedNotifications.isEmpty {
+                        self.log("\n=== CLEANING UP ORPHANED NOTIFICATIONS ===")
+                        self.log("Found \(orphanedNotifications.count) orphaned notifications")
+                        
+                        let identifiersToRemove = orphanedNotifications.map { $0.identifier }
+                        UNUserNotificationCenter.current().removePendingNotificationRequests(
+                            withIdentifiers: identifiersToRemove
+                        )
+                        
+                        // Print details of removed notifications
+                        for notification in orphanedNotifications {
+                            self.log("\nRemoved notification:")
+                            self.log("ID: \(notification.identifier)")
+                            self.log("Alarm ID: \(notification.content.userInfo["alarmId"] as? String ?? "unknown")")
+                            self.log("Title: \(notification.content.title)")
+                            if let trigger = notification.trigger as? UNCalendarNotificationTrigger,
+                               let nextTrigger = trigger.nextTriggerDate() {
+                                self.log("Next trigger: \(self.formatDate(nextTrigger))")
+                            }
+                        }
+                        self.log("-----------------------------")
+                    }
+                    
                     // Create a string representation of current notifications
                     let currentNotifications = requests.compactMap { request -> String? in
                         guard let alarmId = request.content.userInfo["alarmId"] as? String,
@@ -71,11 +197,11 @@ struct ContentView: View {
                     
                     // Only print if notifications have changed
                     if currentNotifications != self.lastPendingNotifications {
-                        print("\n=== PENDING NOTIFICATIONS CHANGED ===")
-                        print("\nTotal Notifications: \(requests.count)")
-                        print("Timestamp: \(self.formatDate(Date()))")
-                        print("\nNotifications by Day:")
-                        print("-----------------------------")
+                        self.log("\n=== PENDING NOTIFICATIONS CHANGED ===")
+                        self.log("\nTotal Notifications: \(requests.count)")
+                        self.log("Timestamp: \(self.formatDate(Date()))")
+                        self.log("\nNotifications by Day:")
+                        self.log("-----------------------------")
                         
                         // Group notifications by alarm ID
                         let groupedRequests = Dictionary(grouping: requests) { request -> String in
@@ -83,12 +209,35 @@ struct ContentView: View {
                         }
                         
                         for (alarmId, alarmRequests) in groupedRequests {
+                            // Find the corresponding alarm object to get snooze info
+                            let alarm = self.alarms.first { $0.id.uuidString == alarmId }
+                            
                             if let firstRequest = alarmRequests.first {
-                                print("\nAlarm ID: \(alarmId)")
-                                print("Title: \(firstRequest.content.title)")
-                                print("Sound: \(firstRequest.content.userInfo["soundName"] as? String ?? "None")")
-                                print("Interruption Level: \(firstRequest.content.interruptionLevel.rawValue)")
-                                print("\nScheduled Times:")
+                                self.log("\nAlarm ID: \(alarmId)")
+                                self.log("Title: \(firstRequest.content.userInfo["alarmName"] as? String ?? firstRequest.content.title)")
+                                self.log("Sound: \(firstRequest.content.userInfo["soundName"] as? String ?? "None")")
+                                self.log("Interruption Level: \(firstRequest.content.interruptionLevel.rawValue)")
+                                
+                                // Add snooze status if available
+                                if let alarm = alarm,
+                                   let snoozedUntil = alarm.snoozedUntil {
+                                    let now = Date()
+                                    if snoozedUntil > now {
+                                        self.log("Snooze Status: Active")
+                                        self.log("Snoozed Until: \(self.formatDate(snoozedUntil))")
+                                        let timeRemaining = snoozedUntil.timeIntervalSince(now)
+                                        let minutes = Int(timeRemaining) / 60
+                                        let seconds = Int(timeRemaining) % 60
+                                        self.log("Snooze Remaining: \(minutes)m \(seconds)s")
+                                    } else {
+                                        self.log("Snooze Status: Expired")
+                                        self.log("Last Snooze Time: \(self.formatDate(snoozedUntil))")
+                                    }
+                                } else {
+                                    self.log("Snooze Status: None")
+                                }
+                                
+                                self.log("\nScheduled Times:")
                             }
                             
                             // Sort requests by next trigger date
@@ -104,9 +253,9 @@ struct ContentView: View {
                             // Print each day's trigger time
                             for (weekday, triggerDate) in sortedRequests {
                                 let dayName = Self.dayName(weekday)
-                                print("  \(dayName.padRight(toLength: 10)): \(self.formatDate(triggerDate))")
+                                self.log("  \(dayName.padRight(toLength: 10)): \(self.formatDate(triggerDate))")
                             }
-                            print("-----------------------------")
+                            self.log("-----------------------------")
                         }
                         
                         // Update last known state
@@ -114,13 +263,19 @@ struct ContentView: View {
                     }
                 }
             } else {
-                print("No saved alarms found.")
+                self.log("No saved alarms found.")
             }
         }
         
         private func formatDate(_ date: Date) -> String {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+            return formatter.string(from: date)
+        }
+        
+        private func formatTime(_ date: Date) -> String {
+            let formatter = DateFormatter()
+            formatter.timeStyle = .short
             return formatter.string(from: date)
         }
         
@@ -135,13 +290,25 @@ struct ContentView: View {
             cancelAlarm(alarm)
             
             // Don't schedule if no days are selected
-            guard !alarm.days.isEmpty else { return }
+            guard !alarm.days.isEmpty else { 
+                refreshNotificationStatus()
+                return 
+            }
             
             let content = UNMutableNotificationContent()
+            // Use the alarm's actual name for the title
             content.title = alarm.name
-            content.body = "Time to rise and shine"
+            // Add more context in the body based on the alarm name
+            content.body = alarm.name.lowercased().contains("wake") ? 
+                "Time to rise and shine" : 
+                "Your alarm '\(alarm.name)' is ringing"
             content.categoryIdentifier = "ALARM_CATEGORY"
-            content.userInfo = ["soundName": alarm.soundName, "alarmId": alarm.id.uuidString]
+            // Store the alarm name in userInfo for reference
+            content.userInfo = [
+                "soundName": alarm.soundName,
+                "alarmId": alarm.id.uuidString,
+                "alarmName": alarm.name
+            ]
             content.interruptionLevel = .timeSensitive
             
             // Handle system sounds differently
@@ -156,8 +323,17 @@ struct ContentView: View {
                 }
             }
             
+            // Log notification setup
+            self.log("Scheduling notifications for alarm: '\(alarm.name)'")
+            self.log("Days: \(alarm.days.sorted().map { Self.dayName($0) }.joined(separator: ", "))")
+            self.log("Time: \(formatTime(alarm.time))")
+            self.log("Sound: \(alarm.soundName)")
+            
             // Create notifications only for selected days
             let calendar = Calendar.current
+            var scheduledCount = 0
+            let totalToSchedule = alarm.days.count
+            
             for day in alarm.days.sorted() {
                 var dateComponents = calendar.dateComponents([.hour, .minute], from: alarm.time)
                 dateComponents.weekday = day
@@ -169,9 +345,19 @@ struct ContentView: View {
                     trigger: trigger
                 )
                 
-                UNUserNotificationCenter.current().add(request) { error in
+                UNUserNotificationCenter.current().add(request) { [weak self] error in
                     if let error = error {
-                        print("Error scheduling alarm for \(Self.dayName(day)): \(error)")
+                        self?.log("Error scheduling alarm '\(alarm.name)' for \(Self.dayName(day)): \(error)")
+                    } else {
+                        self?.log("Successfully scheduled '\(alarm.name)' for \(Self.dayName(day))")
+                    }
+                    
+                    scheduledCount += 1
+                    if scheduledCount == totalToSchedule {
+                        // All notifications have been scheduled, refresh status
+                        DispatchQueue.main.async {
+                            self?.refreshNotificationStatus()
+                        }
                     }
                 }
             }
@@ -186,8 +372,19 @@ struct ContentView: View {
                     withIdentifiers: ["\(alarm.id)-\(day)"]
                 )
             }
+            
+            // Also remove any snooze notifications
+            UNUserNotificationCenter.current().removePendingNotificationRequests(
+                withIdentifiers: ["snooze-\(alarm.id)"]
+            )
+            
             AudioManager.shared.stopAlarmSound()
             saveAlarms()
+            
+            // Refresh notification status after cancellation
+            DispatchQueue.main.async { [weak self] in
+                self?.refreshNotificationStatus()
+            }
         }
         
         private func prettyPrintAlarms(_ alarms: [Alarm]) throws -> String {
@@ -196,13 +393,13 @@ struct ContentView: View {
             
             // Create a sorted array of dictionaries for each alarm
             let sortedAlarms = alarms.map { alarm -> [String: Any] in
-                var dict: [String: Any] = [
+                let dict: [String: Any] = [
                     "id": alarm.id.uuidString, // Keep id at the top
                     "time": formatDate(alarm.time), // Convert Date to String
                     "isEnabled": alarm.isEnabled,
                     "soundName": alarm.soundName,
                     "days": Array(alarm.days).sorted(), // Sort days
-                    "snoozedUntil": alarm.snoozedUntil != nil ? formatDate(alarm.snoozedUntil!) : nil, // Convert Date to String
+                    "snoozedUntil": alarm.snoozedUntil.map { formatDate($0) } as Any, // Handle optional with map
                     "name": alarm.name
                 ]
                 
@@ -269,6 +466,8 @@ struct AlarmsView: View {
     @State private var notificationGranted = false
     @State private var alarmToDisable: Alarm? = nil
     @State private var showingDisableConfirmation = false
+    @State private var showingSnoozedDialog = false
+    @State private var selectedSnoozedAlarm: Alarm?
     
     var body: some View {
         ZStack {
@@ -287,20 +486,50 @@ struct AlarmsView: View {
                     LazyVStack(spacing: 16) {
                         ForEach(sortedAlarms) { alarm in
                             HStack {
-                                AlarmCard(
-                                    alarm: binding(for: alarm),
-                                    onToggle: { isEnabled in
-                                        if !isEnabled && alarm.snoozedUntil != nil {
-                                            alarmToDisable = alarm
-                                            showingDisableConfirmation = true
-                                        } else {
-                                            toggleAlarm(alarm, isEnabled: isEnabled)
-                                        }
-                                    },
-                                    onDelete: {
-                                        deleteAlarm(alarm)
+                                if let snoozedUntil = alarm.snoozedUntil,
+                                   snoozedUntil > Date() {
+                                    // For snoozed alarms, show a button that triggers the snooze dialog
+                                    Button(action: {
+                                        selectedSnoozedAlarm = alarm
+                                        showingSnoozedDialog = true
+                                    }) {
+                                        AlarmCard(
+                                            alarm: binding(for: alarm),
+                                            onToggle: { isEnabled in
+                                                if !isEnabled && alarm.snoozedUntil != nil {
+                                                    alarmToDisable = alarm
+                                                    showingDisableConfirmation = true
+                                                } else {
+                                                    toggleAlarm(alarm, isEnabled: isEnabled)
+                                                }
+                                            },
+                                            onDelete: {
+                                                deleteAlarm(alarm)
+                                            }
+                                        )
                                     }
-                                )
+                                } else {
+                                    // For non-snoozed alarms, use NavigationLink for editing
+                                    NavigationLink(destination: AlarmEditView(
+                                        alarm: binding(for: alarm),
+                                        isNew: false
+                                    )) {
+                                        AlarmCard(
+                                            alarm: binding(for: alarm),
+                                            onToggle: { isEnabled in
+                                                if !isEnabled && alarm.snoozedUntil != nil {
+                                                    alarmToDisable = alarm
+                                                    showingDisableConfirmation = true
+                                                } else {
+                                                    toggleAlarm(alarm, isEnabled: isEnabled)
+                                                }
+                                            },
+                                            onDelete: {
+                                                deleteAlarm(alarm)
+                                            }
+                                        )
+                                    }
+                                }
                                 
                                 Button(action: {
                                     withAnimation {
@@ -314,22 +543,6 @@ struct AlarmsView: View {
                                 .padding(.leading, 8)
                             }
                             .padding(.horizontal)
-                            .swipeActions(edge: .trailing) {
-                                Button(action: {
-                                    if !alarm.isEnabled || alarm.snoozedUntil == nil {
-                                        withAnimation {
-                                            toggleAlarm(alarm, isEnabled: !alarm.isEnabled)
-                                        }
-                                    } else {
-                                        alarmToDisable = alarm
-                                        showingDisableConfirmation = true
-                                    }
-                                }) {
-                                    Label(alarm.isEnabled ? "Disable" : "Enable",
-                                          systemImage: alarm.isEnabled ? "bell.slash.fill" : "bell.fill")
-                                }
-                                .tint(alarm.isEnabled ? .red : .green)
-                            }
                         }
                         .padding(.vertical, 4)
                     }
@@ -375,6 +588,29 @@ struct AlarmsView: View {
                         scheduleAlarm(newAlarm)
                     }
                 )
+            }
+        }
+        .confirmationDialog(
+            "Snoozed Alarm",
+            isPresented: $showingSnoozedDialog,
+            titleVisibility: .visible
+        ) {
+            Button("Dismiss Alarm", role: .destructive) {
+                if let alarm = selectedSnoozedAlarm,
+                   let index = state.alarms.firstIndex(where: { $0.id == alarm.id }) {
+                    state.alarms[index].snoozedUntil = nil
+                    state.saveAlarms()
+                    
+                    // Cancel any pending snooze notifications
+                    UNUserNotificationCenter.current().removePendingNotificationRequests(
+                        withIdentifiers: ["snooze-\(alarm.id)"]
+                    )
+                }
+            }
+            Button("Close", role: .cancel) { }
+        } message: {
+            if let alarm = selectedSnoozedAlarm {
+                Text("\(alarm.name)\nSet for \(formatTime(alarm.time))\nCurrently snoozed until \(formatTime(alarm.snoozedUntil ?? Date()))")
             }
         }
     }
@@ -566,6 +802,12 @@ struct AlarmsView: View {
             state.saveAlarms()
         }
     }
+    
+    private func formatTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
 }
 
 // Create a new StatusView
@@ -574,6 +816,8 @@ struct StatusView: View {
     @Environment(\.colorScheme) var colorScheme
     @Environment(\.scenePhase) var scenePhase
     @State private var showingAbout = false
+    @State private var showingSnoozedDialog = false
+    @State private var selectedSnoozedAlarm: Alarm?
     
     // Add timer to update countdown
     @State private var currentTime = Date()
@@ -644,49 +888,25 @@ struct StatusView: View {
                     
                     // Next Alarm Card - Make it look like a button
                     if let nextAlarm = nextScheduledAlarm {
-                        NavigationLink(destination: AlarmEditView(
-                            alarm: binding(for: nextAlarm),
-                            isNew: false
-                        )) {
-                            VStack(alignment: .leading, spacing: 12) {
-                                Text("Next Alarm")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                                Text(nextAlarm.name)
-                                    .font(.system(size: 34, weight: .medium, design: .rounded))
-                                
-                                // Show either snooze countdown or regular alarm countdown
-                                if let snoozedUntil = nextAlarm.snoozedUntil,
-                                   snoozedUntil > currentTime {
-                                    // Snooze countdown
-                                    HStack {
-                                        Image(systemName: "zzz")
-                                            .font(.caption)
-                                        Text(timeUntilSnooze(snoozedUntil))
-                                    }
-                                    .font(.subheadline)
-                                    .foregroundColor(.blue)
-                                    .padding(.vertical, 2)
-                                    .padding(.horizontal, 8)
-                                    .background(Color.blue.opacity(0.1))
-                                    .cornerRadius(6)
-                                } else {
-                                    // Regular alarm countdown
-                                    HStack {
-                                        Image(systemName: "clock")
-                                            .font(.caption)
-                                        Text(timeUntilNextAlarm)
-                                    }
-                                    .font(.subheadline)
-                                    .foregroundColor(.green)
-                                    .padding(.vertical, 2)
-                                    .padding(.horizontal, 8)
-                                    .background(Color.green.opacity(0.1))
-                                    .cornerRadius(6)
+                        Group {
+                            if let snoozedUntil = nextAlarm.snoozedUntil,
+                               snoozedUntil > currentTime {
+                                // If next alarm is snoozed, show button that triggers snooze dialog
+                                Button(action: {
+                                    selectedSnoozedAlarm = nextAlarm
+                                    showingSnoozedDialog = true
+                                }) {
+                                    NextAlarmContent(alarm: nextAlarm, currentTime: currentTime)
+                                }
+                            } else {
+                                // If not snoozed, use NavigationLink to edit view
+                                NavigationLink(destination: AlarmEditView(
+                                    alarm: binding(for: nextAlarm),
+                                    isNew: false
+                                )) {
+                                    NextAlarmContent(alarm: nextAlarm, currentTime: currentTime)
                                 }
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
                         }
                         .buttonStyle(PlainButtonStyle())
                     } else {
@@ -721,24 +941,31 @@ struct StatusView: View {
 
                 // Active Alarms Section
                 Section {
-                    NavigationLink(destination: AlarmsView(state: state)) {
-                        HStack {
-                            Text("Active Alarms")
+                    if state.alarms.filter({ $0.isEnabled && $0.snoozedUntil == nil }).isEmpty {
+                        // Show only the Manage Alarms button when no active alarms
+                        NavigationLink(destination: AlarmsView(state: state)) {
+                            Text("Manage Alarms")
                                 .font(.headline)
-                            Spacer()
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.blue)
+                                .cornerRadius(12)
                         }
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    
-                    if state.alarms.filter({ $0.isEnabled }).isEmpty {
-                        HStack {
-                            Text("No active alarms")
-                                .foregroundColor(.secondary)
-                            Spacer()
-                        }
-                        .padding(.vertical, 8)
                     } else {
-                        ForEach(state.alarms.filter { $0.isEnabled }) { alarm in
+                        // Show full section with title and alarms when there are active alarms
+                        NavigationLink(destination: AlarmsView(state: state)) {
+                            HStack {
+                                Text("Active Alarms")
+                                    .font(.headline)
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        
+                        ForEach(state.alarms.filter { 
+                            $0.isEnabled && $0.snoozedUntil == nil
+                        }) { alarm in
                             NavigationLink(destination: AlarmEditView(
                                 alarm: binding(for: alarm),
                                 isNew: false
@@ -750,26 +977,13 @@ struct StatusView: View {
                         }
                     }
                     
-                    if state.alarms.count < ContentView.maxAlarms {
-                        VStack(spacing: 20) {
-                            NavigationLink(destination: AlarmsView(state: state)) {
-                                Text("Manage Alarms")
-                                    .font(.headline)
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding()
-                                    .background(Color.blue)
-                                    .cornerRadius(12)
-                            }
-                        }
-                    } else {
+                    if state.alarms.count >= ContentView.maxAlarms {
                         Text("Maximum number of alarms reached")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical)
                     }
-
                 }
                 
             }
@@ -786,6 +1000,29 @@ struct StatusView: View {
         }
         .sheet(isPresented: $showingAbout) {
             AboutView()
+        }
+        .confirmationDialog(
+            "Snoozed Alarm",
+            isPresented: $showingSnoozedDialog,
+            titleVisibility: .visible
+        ) {
+            Button("Dismiss Alarm", role: .destructive) {
+                if let alarm = selectedSnoozedAlarm,
+                   let index = state.alarms.firstIndex(where: { $0.id == alarm.id }) {
+                    state.alarms[index].snoozedUntil = nil
+                    state.saveAlarms()
+                    
+                    // Cancel any pending snooze notifications
+                    UNUserNotificationCenter.current().removePendingNotificationRequests(
+                        withIdentifiers: ["snooze-\(alarm.id)"]
+                    )
+                }
+            }
+            Button("Close", role: .cancel) { }
+        } message: {
+            if let alarm = selectedSnoozedAlarm {
+                Text("\(alarm.name)\nSet for \(formatTime(alarm.time))\nCurrently snoozed until \(formatTime(alarm.snoozedUntil ?? Date()))")
+            }
         }
         .onReceive(timer) { _ in
             currentTime = Date()
@@ -822,6 +1059,12 @@ struct StatusView: View {
         
         // Save any changes
         state.saveAlarms()
+    }
+    
+    private func formatTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
     
     private var nextScheduledAlarm: Alarm? {
@@ -909,12 +1152,6 @@ struct StatusView: View {
                 }
                 return aTime < bTime
             }
-    }
-    
-    private func formatTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
     }
     
     private func daysString(for alarm: Alarm) -> String {
@@ -1179,6 +1416,7 @@ struct AlarmCard: View {
     @State private var showingEditSheet = false
     let onToggle: (Bool) -> Void
     let onDelete: () -> Void
+    @ObservedObject var state = ContentView.shared  // Add state reference
     
     var body: some View {
         VStack(spacing: 12) {
@@ -1198,6 +1436,8 @@ struct AlarmCard: View {
                                 .font(.caption)
                             Text("Snoozed until \(formatTime(snoozedUntil))")
                             
+                            Spacer()
+                            
                             Button(action: cancelSnooze) {
                                 Image(systemName: "xmark.circle.fill")
                                     .foregroundColor(.red)
@@ -1213,16 +1453,6 @@ struct AlarmCard: View {
                 }
                 
                 Spacer()
-                
-                // Toggle
-                // Toggle("", isOn: $alarm.isEnabled)
-                //     .tint(.blue)
-                //     .onChange(of: alarm.isEnabled) { _, isEnabled in
-                //         if isEnabled {
-                //             alarm.snoozedUntil = nil  // Clear snooze when enabling
-                //         }
-                //         onToggle(isEnabled)
-                //     }
             }
             
             HStack {
@@ -1256,7 +1486,10 @@ struct AlarmCard: View {
         .cornerRadius(16)
         .shadow(color: .black.opacity(0.05), radius: 2, x: 0, y: 1)
         .onTapGesture {
-            showingEditSheet = true
+            // Only allow editing if not snoozed
+            if alarm.snoozedUntil == nil || alarm.snoozedUntil! <= Date() {
+                showingEditSheet = true
+            }
         }
         .sheet(isPresented: $showingEditSheet) {
             AlarmEditView(
@@ -1286,11 +1519,21 @@ struct AlarmCard: View {
     
     private func cancelSnooze() {
         withAnimation {
-            alarm.snoozedUntil = nil
-            // Cancel any pending snooze notifications
-            UNUserNotificationCenter.current().removePendingNotificationRequests(
-                withIdentifiers: ["snooze-\(alarm.id)"]
-            )
+            // Update the alarm in the state
+            if let index = state.alarms.firstIndex(where: { $0.id == alarm.id }) {
+                state.alarms[index].snoozedUntil = nil
+                
+                // Cancel any pending snooze notifications
+                UNUserNotificationCenter.current().removePendingNotificationRequests(
+                    withIdentifiers: ["snooze-\(alarm.id)"]
+                )
+                
+                // Save the changes
+                state.saveAlarms()
+                
+                // Update the binding to reflect the change
+                alarm.snoozedUntil = nil
+            }
         }
     }
 }
@@ -1353,6 +1596,19 @@ struct AlarmEditView: View {
                         .datePickerStyle(.wheel)
                         .labelsHidden()
                         .frame(maxHeight: 200)
+                        .onChange(of: selectedTime) { oldValue, newValue in
+                            if isNew {
+                                // Only update the name if it's still using the default format
+                                let formatter = DateFormatter()
+                                formatter.timeStyle = .short
+                                let oldTimeString = formatter.string(from: oldValue)
+                                let newTimeString = formatter.string(from: newValue)
+                                
+                                if alarmName == "Wake me at \(oldTimeString)" {
+                                    alarmName = "Wake me at \(newTimeString)"
+                                }
+                            }
+                        }
                 }
                 
                 Section {
@@ -1778,21 +2034,22 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     }
     
     private func scheduleSnoozeAlarm(soundName: String, alarmId: String) {
-        guard let alarmUUID = UUID(uuidString: alarmId) else { return }
+        let snoozeIdentifier = "snooze-\(alarmId)"
         
-        let snoozeTime = Date().addingTimeInterval(5 * 60)  // 5 minutes from now
+        // Update the alarm state first
+        if let alarmUUID = UUID(uuidString: alarmId),
+           let index = ContentView.shared.alarms.firstIndex(where: { $0.id == alarmUUID }) {
+            // Set snooze time to 5 minutes from now
+            let snoozeUntil = Date().addingTimeInterval(5 * 60)
+            ContentView.shared.alarms[index].snoozedUntil = snoozeUntil
+            ContentView.shared.saveAlarms()
+            
+            // Log the snooze
+            print("[\(formatDate(Date()))] Snoozing alarm '\(ContentView.shared.alarms[index].name)' until \(formatDate(snoozeUntil))")
+        }
         
-        // Update the alarm's snooze status
+        // Then schedule the notification
         DispatchQueue.main.async {
-            // Find and update the alarm in the shared state
-            if let index = ContentView.shared.alarms.firstIndex(where: { $0.id == alarmUUID }) {
-                ContentView.shared.alarms[index].snoozedUntil = snoozeTime
-                ContentView.shared.saveAlarms()
-            }
-            
-            // Create unique identifier for snoozed notification
-            let snoozeIdentifier = "snooze-\(alarmId)-\(Date().timeIntervalSince1970)"
-            
             let content = UNMutableNotificationContent()
             content.title = "Snoozed Alarm"
             content.body = "Wake up! (Snoozed alarm)"
@@ -1821,8 +2078,25 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             )
             
             // Schedule the new snooze notification
-            UNUserNotificationCenter.current().add(request)
+            UNUserNotificationCenter.current().add(request) { error in
+                if let error = error {
+                    print("[\(self.formatDate(Date()))] Error scheduling snooze notification: \(error)")
+                } else {
+                    print("[\(self.formatDate(Date()))] Successfully scheduled snooze notification")
+                }
+                
+                // Force a refresh of the notification status
+                DispatchQueue.main.async {
+                    ContentView.shared.refreshNotificationStatus()
+                }
+            }
         }
+    }
+    
+    private func formatDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+        return formatter.string(from: date)
     }
     
     // Clean up when app goes to background
@@ -2139,5 +2413,136 @@ extension String {
             return self
         }
         return self + String(repeating: " ", count: length - self.count)
+    }
+}
+
+// Add a new view for the Next Alarm content
+struct NextAlarmContent: View {
+    let alarm: Alarm
+    let currentTime: Date
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Next Alarm")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+            Text(alarm.name)
+                .font(.system(size: 34, weight: .medium, design: .rounded))
+            
+            // Show either snooze countdown or regular alarm countdown
+            if let snoozedUntil = alarm.snoozedUntil,
+               snoozedUntil > currentTime {
+                // Snooze countdown
+                HStack {
+                    Image(systemName: "zzz")
+                        .font(.caption)
+                    Text(timeUntilSnooze(snoozedUntil))
+                }
+                .font(.subheadline)
+                .foregroundColor(.blue)
+                .padding(.vertical, 2)
+                .padding(.horizontal, 8)
+                .background(Color.blue.opacity(0.1))
+                .cornerRadius(6)
+            } else {
+                // Regular alarm countdown
+                HStack {
+                    Image(systemName: "clock")
+                        .font(.caption)
+                    Text(timeUntilNextAlarm(alarm))
+                }
+                .font(.subheadline)
+                .foregroundColor(.green)
+                .padding(.vertical, 2)
+                .padding(.horizontal, 8)
+                .background(Color.green.opacity(0.1))
+                .cornerRadius(6)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+    
+    private func timeUntilSnooze(_ snoozeTime: Date) -> String {
+        let diff = snoozeTime.timeIntervalSince(currentTime)
+        
+        if diff < 0 {
+            return "Overdue"
+        }
+        
+        let minutes = Int(diff) / 60
+        let seconds = Int(diff) % 60
+        
+        if minutes > 0 {
+            return "Rings in \(minutes)m \(seconds)s"
+        } else {
+            return "Rings in \(seconds)s"
+        }
+    }
+    
+    private func timeUntilNextAlarm(_ alarm: Alarm) -> String {
+        let targetDate = nextOccurrence(for: alarm)
+        let diff = targetDate.timeIntervalSince(currentTime)
+        
+        if diff < 0 {
+            return "Overdue"
+        }
+        
+        let hours = Int(diff) / 3600
+        let minutes = (Int(diff) % 3600) / 60
+        let seconds = Int(diff) % 60
+        
+        if hours > 0 {
+            return "Rings in \(hours)h \(minutes)m \(seconds)s"
+        } else if minutes > 0 {
+            return "Rings in \(minutes)m \(seconds)s"
+        } else {
+            return "Rings in \(seconds)s"
+        }
+    }
+    
+    private func nextOccurrence(for alarm: Alarm) -> Date {
+        let calendar = Calendar.current
+        let now = currentTime
+        
+        // Get current weekday (1 = Sunday, 2 = Monday, etc.)
+        let currentWeekday = calendar.component(.weekday, from: now)
+        
+        // Get hour and minute components from the alarm time
+        let alarmHour = calendar.component(.hour, from: alarm.time)
+        let alarmMinute = calendar.component(.minute, from: alarm.time)
+        
+        // Create a date for the alarm time today
+        var components = calendar.dateComponents([.year, .month, .day], from: now)
+        components.hour = alarmHour
+        components.minute = alarmMinute
+        components.second = 0
+        
+        guard let todayAlarmTime = calendar.date(from: components) else {
+            return now
+        }
+        
+        // If alarm is set for later today, return that time
+        if todayAlarmTime > now {
+            if alarm.days.contains(currentWeekday) {
+                return todayAlarmTime
+            }
+        }
+        
+        // Find the next day the alarm should ring
+        var daysToAdd = 1
+        var nextWeekday = currentWeekday
+        for _ in 1...7 {
+            nextWeekday = nextWeekday % 7 + 1
+            if alarm.days.contains(nextWeekday) {
+                guard let nextDate = calendar.date(byAdding: .day, value: daysToAdd, to: todayAlarmTime) else {
+                    return now
+                }
+                return nextDate
+            }
+            daysToAdd += 1
+        }
+        
+        return now
     }
 }
