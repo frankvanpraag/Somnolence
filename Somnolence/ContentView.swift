@@ -51,6 +51,50 @@ struct ContentView: View {
         
         init() {
             loadAlarms()
+            // Ensure notifications are scheduled for all enabled alarms
+            rescheduleAllAlarms()
+            
+            // Register for app termination notification
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleAppTermination),
+                name: UIApplication.willTerminateNotification,
+                object: nil
+            )
+            
+            // Register for time change notifications
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleSignificantTimeChange),
+                name: UIApplication.significantTimeChangeNotification,
+                object: nil
+            )
+        }
+        
+        @objc public func handleAppTermination() {
+            // Save current state
+            saveAlarms()
+            
+            // Ensure all notifications are properly scheduled
+            rescheduleAllAlarms()
+        }
+        
+        @objc public func handleSignificantTimeChange() {
+            // Reschedule all alarms when time changes significantly (e.g., timezone change)
+            rescheduleAllAlarms()
+        }
+        
+        public func rescheduleAllAlarms() {
+            // First, cancel all existing notifications
+            UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+            
+            // Then reschedule all enabled alarms
+            for alarm in alarms where alarm.isEnabled {
+                scheduleAlarm(alarm)
+            }
+            
+            // Force a refresh of the notification status
+            refreshNotificationStatus()
         }
         
         // Add function to force notification status refresh
@@ -198,9 +242,9 @@ struct ContentView: View {
                     // Only print if notifications have changed
                     if currentNotifications != self.lastPendingNotifications {
                         self.log("\n=== PENDING NOTIFICATIONS CHANGED ===")
-                        self.log("\nTotal Notifications: \(requests.count)")
+                        self.log("Total Notifications: \(requests.count)")
                         self.log("Timestamp: \(self.formatDate(Date()))")
-                        self.log("\nNotifications by Day:")
+                        self.log("Notifications by Day:")
                         self.log("-----------------------------")
                         
                         // Group notifications by alarm ID
@@ -213,8 +257,11 @@ struct ContentView: View {
                             let alarm = self.alarms.first { $0.id.uuidString == alarmId }
                             
                             if let firstRequest = alarmRequests.first {
-                                self.log("\nAlarm ID: \(alarmId)")
+                                self.log("Alarm ID: \(alarmId)")
                                 self.log("Title: \(firstRequest.content.userInfo["alarmName"] as? String ?? firstRequest.content.title)")
+                                if let alarm = alarm {
+                                    self.log("AlarmTime: \(self.formatTime(alarm.time))")
+                                }
                                 self.log("Sound: \(firstRequest.content.userInfo["soundName"] as? String ?? "None")")
                                 self.log("Interruption Level: \(firstRequest.content.interruptionLevel.rawValue)")
                                 
@@ -237,7 +284,7 @@ struct ContentView: View {
                                     self.log("Snooze Status: None")
                                 }
                                 
-                                self.log("\nScheduled Times:")
+                                // self.log("Scheduled Times:")
                             }
                             
                             // Sort requests by next trigger date
@@ -250,11 +297,11 @@ struct ContentView: View {
                                 return (weekday, nextTrigger)
                             }.sorted { $0.0 < $1.0 }
                             
-                            // Print each day's trigger time
-                            for (weekday, triggerDate) in sortedRequests {
-                                let dayName = Self.dayName(weekday)
-                                self.log("  \(dayName.padRight(toLength: 10)): \(self.formatDate(triggerDate))")
-                            }
+                            // Print scheduled days in compact format
+                            let scheduledDays = sortedRequests.map { $0.0 }
+                            let dayLetters = ["S", "M", "T", "W", "T", "F", "S"]
+                            let scheduleString = scheduledDays.map { dayLetters[$0 - 1] }.joined(separator: " ")
+                            self.log("Schedule: \(scheduleString)")
                             self.log("-----------------------------")
                         }
                         
@@ -296,14 +343,11 @@ struct ContentView: View {
             }
             
             let content = UNMutableNotificationContent()
-            // Use the alarm's actual name for the title
             content.title = alarm.name
-            // Add more context in the body based on the alarm name
             content.body = alarm.name.lowercased().contains("wake") ? 
                 "Time to rise and shine" : 
                 "Your alarm '\(alarm.name)' is ringing"
             content.categoryIdentifier = "ALARM_CATEGORY"
-            // Store the alarm name in userInfo for reference
             content.userInfo = [
                 "soundName": alarm.soundName,
                 "alarmId": alarm.id.uuidString,
@@ -323,19 +367,14 @@ struct ContentView: View {
                 }
             }
             
-            // Log notification setup
-            self.log("Scheduling notifications for alarm: '\(alarm.name)'")
-            self.log("Days: \(alarm.days.sorted().map { Self.dayName($0) }.joined(separator: ", "))")
-            self.log("Time: \(formatTime(alarm.time))")
-            self.log("Sound: \(alarm.soundName)")
-            
-            // Create notifications only for selected days
-            let calendar = Calendar.current
+            // Create notifications for each selected day
+            let dispatchGroup = DispatchGroup()
             var scheduledCount = 0
             let totalToSchedule = alarm.days.count
             
             for day in alarm.days.sorted() {
-                var dateComponents = calendar.dateComponents([.hour, .minute], from: alarm.time)
+                dispatchGroup.enter()
+                var dateComponents = Calendar.current.dateComponents([.hour, .minute], from: alarm.time)
                 dateComponents.weekday = day
                 
                 let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: true)
@@ -353,16 +392,15 @@ struct ContentView: View {
                     }
                     
                     scheduledCount += 1
-                    if scheduledCount == totalToSchedule {
-                        // All notifications have been scheduled, refresh status
-                        DispatchQueue.main.async {
-                            self?.refreshNotificationStatus()
-                        }
-                    }
+                    dispatchGroup.leave()
                 }
             }
             
-            saveAlarms()
+            // Wait for all notifications to be scheduled before refreshing UI
+            dispatchGroup.notify(queue: .main) { [weak self] in
+                self?.saveAlarms()
+                self?.refreshNotificationStatus()
+            }
         }
         
         func cancelAlarm(_ alarm: Alarm) {
@@ -409,6 +447,26 @@ struct ContentView: View {
             // Convert the sorted array of dictionaries to JSON
             let jsonData = try JSONSerialization.data(withJSONObject: sortedAlarms, options: .prettyPrinted)
             return String(data: jsonData, encoding: .utf8) ?? "Error converting to string"
+        }
+        
+        // Add a public method for background task handling
+        public func handleBackgroundRefresh() {
+            // Verify and update all alarm states
+            loadAlarms()
+            
+            // Clean up any expired snoozes
+            let now = Date()
+            for (index, alarm) in alarms.enumerated() {
+                if let snoozedUntil = alarm.snoozedUntil, snoozedUntil < now {
+                    alarms[index].snoozedUntil = nil
+                }
+            }
+            
+            // Ensure all notifications are properly scheduled
+            rescheduleAllAlarms()
+            
+            // Save any changes
+            saveAlarms()
         }
     }
     
@@ -941,27 +999,13 @@ struct StatusView: View {
 
                 // Active Alarms Section
                 Section {
-                    if state.alarms.filter({ $0.isEnabled && $0.snoozedUntil == nil }).isEmpty {
-                        // Show only the Manage Alarms button when no active alarms
-                        NavigationLink(destination: AlarmsView(state: state)) {
-                            Text("Manage Alarms")
+                    // Show title and alarms when there are active alarms
+                    if !state.alarms.filter({ $0.isEnabled && $0.snoozedUntil == nil }).isEmpty {
+                        HStack {
+                            Text("Active Alarms")
                                 .font(.headline)
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(Color.blue)
-                                .cornerRadius(12)
+                            Spacer()
                         }
-                    } else {
-                        // Show full section with title and alarms when there are active alarms
-                        NavigationLink(destination: AlarmsView(state: state)) {
-                            HStack {
-                                Text("Active Alarms")
-                                    .font(.headline)
-                                Spacer()
-                            }
-                        }
-                        .buttonStyle(PlainButtonStyle())
                         
                         ForEach(state.alarms.filter { 
                             $0.isEnabled && $0.snoozedUntil == nil
@@ -977,7 +1021,20 @@ struct StatusView: View {
                         }
                     }
                     
-                    if state.alarms.count >= ContentView.maxAlarms {
+                    // Show Manage Alarms button if not at max capacity
+                    if state.alarms.count < ContentView.maxAlarms {
+                        NavigationLink(destination: AlarmsView(state: state)) {
+                            Text("Manage Alarms")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.blue)
+                                .cornerRadius(12)
+                        }
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                    } else {
                         Text("Maximum number of alarms reached")
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -1575,7 +1632,7 @@ struct AlarmEditView: View {
             let formatter = DateFormatter()
             formatter.timeStyle = .short
             let timeString = formatter.string(from: roundedTime)
-            self._alarmName = State(initialValue: "Wake me at \(timeString)")
+            self._alarmName = State(initialValue: "Alarm at \(timeString)")
         } else {
             self._selectedTime = State(initialValue: alarm.wrappedValue.time)
             self._alarmName = State(initialValue: alarm.wrappedValue.name)
@@ -1604,8 +1661,8 @@ struct AlarmEditView: View {
                                 let oldTimeString = formatter.string(from: oldValue)
                                 let newTimeString = formatter.string(from: newValue)
                                 
-                                if alarmName == "Wake me at \(oldTimeString)" {
-                                    alarmName = "Wake me at \(newTimeString)"
+                                if alarmName == "Alarm at \(oldTimeString)" {
+                                    alarmName = "Alarm at \(newTimeString)"
                                 }
                             }
                         }
@@ -1881,6 +1938,8 @@ extension ContentView {
 class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationDelegate()
     private var activeAlarmModal: AlarmModalViewController?
+    private let modalQueue = DispatchQueue(label: "com.somnolence.modalQueue")
+    private var isProcessingAction = false
     
     override init() {
         super.init()
@@ -1931,62 +1990,162 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let userInfo = response.notification.request.content.userInfo
-        
-        switch response.actionIdentifier {
-        case UNNotificationDefaultActionIdentifier:
-            if let soundName = userInfo["soundName"] as? String,
-               let alarmId = userInfo["alarmId"] as? String {
-                showAlarmModal(soundName: soundName, alarmId: alarmId)
-            }
-            
-        case "STOP_ACTION":
+        // Stop sound IMMEDIATELY for snooze or stop actions
+        if response.actionIdentifier == "SNOOZE_ACTION" || response.actionIdentifier == "STOP_ACTION" {
             AudioManager.shared.stopAlarmSound()
-            dismissAlarmModal()
-            
-        case "SNOOZE_ACTION":
-            if let soundName = userInfo["soundName"] as? String,
-               let alarmId = userInfo["alarmId"] as? String {
-                scheduleSnoozeAlarm(soundName: soundName, alarmId: alarmId)
-            }
-            AudioManager.shared.stopAlarmSound()
-            dismissAlarmModal()
-            
-        default:
-            break
         }
         
-        completionHandler()
+        // Then process the action
+        modalQueue.async { [weak self] in
+            guard let self = self, !self.isProcessingAction else {
+                completionHandler()
+                return
+            }
+            
+            self.isProcessingAction = true
+            let userInfo = response.notification.request.content.userInfo
+            
+            switch response.actionIdentifier {
+            case UNNotificationDefaultActionIdentifier:
+                if let soundName = userInfo["soundName"] as? String,
+                   let alarmId = userInfo["alarmId"] as? String {
+                    self.showAlarmModal(soundName: soundName, alarmId: alarmId)
+                }
+                
+            case "STOP_ACTION":
+                // Modal dismissal only - sound already stopped
+                DispatchQueue.main.async {
+                    self.dismissAlarmModal {
+                        self.isProcessingAction = false
+                        completionHandler()
+                    }
+                }
+                return
+                
+            case "SNOOZE_ACTION":
+                if let soundName = userInfo["soundName"] as? String,
+                   let alarmId = userInfo["alarmId"] as? String {
+                    // Schedule snooze - sound already stopped
+                    self.scheduleSnoozeAlarm(soundName: soundName, alarmId: alarmId)
+                    self.dismissAlarmModal {
+                        self.isProcessingAction = false
+                        completionHandler()
+                    }
+                    return
+                }
+                
+            default:
+                break
+            }
+            
+            self.isProcessingAction = false
+            completionHandler()
+        }
+    }
+    
+    private func dismissAlarmModal(completion: (() -> Void)? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self,
+                  let modalVC = self.activeAlarmModal else {
+                completion?()
+                return
+            }
+            
+            modalVC.dismiss(animated: true) {
+                self.activeAlarmModal = nil
+                completion?()
+            }
+        }
+    }
+    
+    private func scheduleSnoozeAlarm(soundName: String, alarmId: String) {
+        let snoozeIdentifier = "snooze-\(alarmId)"
+        
+        // Update the alarm state
+        if let alarmUUID = UUID(uuidString: alarmId),
+           let index = ContentView.shared.alarms.firstIndex(where: { $0.id == alarmUUID }) {
+            let snoozeUntil = Date().addingTimeInterval(5 * 60)
+            
+            // Cancel any existing snooze notifications first
+            UNUserNotificationCenter.current().removePendingNotificationRequests(
+                withIdentifiers: ["snooze-\(alarmId)"]
+            )
+            
+            // Update state and save
+            DispatchQueue.main.async {
+                ContentView.shared.alarms[index].snoozedUntil = snoozeUntil
+                ContentView.shared.saveAlarms()
+                
+                // Schedule the new notification
+                let content = UNMutableNotificationContent()
+                content.title = "Snoozed Alarm"
+                content.body = "Wake up! (Snoozed alarm)"
+                content.sound = UNNotificationSound(named: UNNotificationSoundName("\(soundName).wav"))
+                content.userInfo = ["soundName": soundName, "alarmId": alarmId]
+                content.categoryIdentifier = "ALARM_CATEGORY"
+                
+                if #available(iOS 15.0, *) {
+                    content.interruptionLevel = .timeSensitive
+                }
+                
+                let trigger = UNTimeIntervalNotificationTrigger(
+                    timeInterval: 5 * 60,
+                    repeats: false
+                )
+                
+                let request = UNNotificationRequest(
+                    identifier: snoozeIdentifier,
+                    content: content,
+                    trigger: trigger
+                )
+                
+                // Schedule the new snooze notification
+                UNUserNotificationCenter.current().add(request) { error in
+                    if let error = error {
+                        print("[\(self.formatDate(Date()))] Error scheduling snooze notification: \(error)")
+                    } else {
+                        print("[\(self.formatDate(Date()))] Successfully scheduled snooze notification")
+                    }
+                    
+                    // Force a refresh of the notification status
+                    DispatchQueue.main.async {
+                        ContentView.shared.refreshNotificationStatus()
+                    }
+                }
+            }
+        }
     }
     
     func showAlarmModal(soundName: String, alarmId: String) {
-        DispatchQueue.main.async { [weak self] in
+        modalQueue.async { [weak self] in
             guard let self = self else { return }
             
-            // Check if there's already an active modal
-            if self.activeAlarmModal != nil {
-                print("Alarm modal already active, not showing new one")
-                return
-            }
-            
-            // First play the sound
-            AudioManager.shared.playAlarmSound(named: soundName)
-            
-            // Then ensure we show the modal
-            guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                  let window = windowScene.windows.first,
-                  let rootVC = window.rootViewController else {
-                return
-            }
-            
-            // Ensure no other modal is currently presented
-            if rootVC.presentedViewController != nil {
-                print("Another modal is presented, dismissing it first")
-                rootVC.dismiss(animated: true) { [weak self] in
-                    self?.presentNewAlarmModal(rootVC: rootVC, soundName: soundName, alarmId: alarmId)
+            DispatchQueue.main.async {
+                // Check if there's already an active modal
+                if self.activeAlarmModal != nil {
+                    print("Alarm modal already active, not showing new one")
+                    return
                 }
-            } else {
-                presentNewAlarmModal(rootVC: rootVC, soundName: soundName, alarmId: alarmId)
+                
+                // First play the sound
+                AudioManager.shared.playAlarmSound(named: soundName)
+                
+                // Then ensure we show the modal
+                guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                      let window = windowScene.windows.first,
+                      let rootVC = window.rootViewController else {
+                    return
+                }
+                
+                // Ensure no other modal is currently presented
+                if rootVC.presentedViewController != nil {
+                    print("Another modal is presented, dismissing it first")
+                    rootVC.dismiss(animated: true) { [weak self] in
+                        self?.presentNewAlarmModal(rootVC: rootVC, soundName: soundName, alarmId: alarmId)
+                    }
+                } else {
+                    self.presentNewAlarmModal(rootVC: rootVC, soundName: soundName, alarmId: alarmId)
+                }
             }
         }
     }
@@ -2020,77 +2179,6 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         
         // Present the modal
         rootVC.present(modalVC, animated: true)
-    }
-    
-    private func dismissAlarmModal() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self,
-                  let modalVC = self.activeAlarmModal else { return }
-            
-            modalVC.dismiss(animated: true) {
-                self.activeAlarmModal = nil
-            }
-        }
-    }
-    
-    private func scheduleSnoozeAlarm(soundName: String, alarmId: String) {
-        let snoozeIdentifier = "snooze-\(alarmId)"
-        
-        // Update the alarm state first
-        if let alarmUUID = UUID(uuidString: alarmId),
-           let index = ContentView.shared.alarms.firstIndex(where: { $0.id == alarmUUID }) {
-            // Set snooze time to 5 minutes from now
-            let snoozeUntil = Date().addingTimeInterval(5 * 60)
-            ContentView.shared.alarms[index].snoozedUntil = snoozeUntil
-            ContentView.shared.saveAlarms()
-            
-            // Log the snooze
-            print("[\(formatDate(Date()))] Snoozing alarm '\(ContentView.shared.alarms[index].name)' until \(formatDate(snoozeUntil))")
-        }
-        
-        // Then schedule the notification
-        DispatchQueue.main.async {
-            let content = UNMutableNotificationContent()
-            content.title = "Snoozed Alarm"
-            content.body = "Wake up! (Snoozed alarm)"
-            content.sound = UNNotificationSound(named: UNNotificationSoundName("\(soundName).wav"))
-            content.userInfo = ["soundName": soundName, "alarmId": alarmId]
-            content.categoryIdentifier = "ALARM_CATEGORY"
-            
-            if #available(iOS 15.0, *) {
-                content.interruptionLevel = .timeSensitive
-            }
-            
-            let trigger = UNTimeIntervalNotificationTrigger(
-                timeInterval: 5 * 60,
-                repeats: false
-            )
-            
-            let request = UNNotificationRequest(
-                identifier: snoozeIdentifier,
-                content: content,
-                trigger: trigger
-            )
-            
-            // Cancel any existing snooze notifications for this alarm
-            UNUserNotificationCenter.current().removePendingNotificationRequests(
-                withIdentifiers: ["snooze-\(alarmId)"]
-            )
-            
-            // Schedule the new snooze notification
-            UNUserNotificationCenter.current().add(request) { error in
-                if let error = error {
-                    print("[\(self.formatDate(Date()))] Error scheduling snooze notification: \(error)")
-                } else {
-                    print("[\(self.formatDate(Date()))] Successfully scheduled snooze notification")
-                }
-                
-                // Force a refresh of the notification status
-                DispatchQueue.main.async {
-                    ContentView.shared.refreshNotificationStatus()
-                }
-            }
-        }
     }
     
     private func formatDate(_ date: Date) -> String {

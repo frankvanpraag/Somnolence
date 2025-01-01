@@ -83,12 +83,20 @@ class AudioManager {
     }
     
     func stopAlarmSound() {
+        // Stop audio player if active
         audioPlayer?.stop()
         audioPlayer = nil
         
         // Stop system sound loop if active
         systemSoundTimer?.invalidate()
         systemSoundTimer = nil
+        
+        // Deactivate audio session
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            print("Failed to deactivate audio session: \(error)")
+        }
         
         endBackgroundTask()
     }
