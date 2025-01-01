@@ -2,7 +2,7 @@
 //  SomnolenceApp.swift
 //  Somnolence
 //
-//  Created by Frank van Praag on 17/12/2024.
+//  Created by Ming Bow on 17/12/2024.
 //
 
 import SwiftUI
