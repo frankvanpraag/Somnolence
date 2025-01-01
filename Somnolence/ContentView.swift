@@ -333,10 +333,27 @@ struct ContentView: View {
         }
         
         func scheduleAlarm(_ alarm: Alarm) {
-            // First cancel any existing notifications
-            cancelAlarm(alarm)
+            // First ensure the alarm is saved in state without affecting other alarms
+            if let index = alarms.firstIndex(where: { $0.id == alarm.id }) {
+                // Update existing alarm
+                alarms[index] = alarm
+            } else {
+                // Add new alarm without affecting existing ones
+                alarms.append(alarm)
+            }
             
-            // Don't schedule if no days are selected
+            // Save all alarms
+            saveAlarms()
+            
+            // Then handle notifications
+            // First cancel existing notifications for this alarm only
+            for day in 1...7 {
+                UNUserNotificationCenter.current().removePendingNotificationRequests(
+                    withIdentifiers: ["\(alarm.id)-\(day)"]
+                )
+            }
+            
+            // Don't schedule notifications if no days are selected, but keep the alarm
             guard !alarm.days.isEmpty else { 
                 refreshNotificationStatus()
                 return 
@@ -370,7 +387,7 @@ struct ContentView: View {
             // Create notifications for each selected day
             let dispatchGroup = DispatchGroup()
             var scheduledCount = 0
-            let totalToSchedule = alarm.days.count
+            _ = alarm.days.count
             
             for day in alarm.days.sorted() {
                 dispatchGroup.enter()
@@ -398,7 +415,6 @@ struct ContentView: View {
             
             // Wait for all notifications to be scheduled before refreshing UI
             dispatchGroup.notify(queue: .main) { [weak self] in
-                self?.saveAlarms()
                 self?.refreshNotificationStatus()
             }
         }
@@ -478,6 +494,22 @@ struct ContentView: View {
         requestNotificationPermission()
     }
     
+    private var isLandscape: Bool {
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+            return false
+        }
+        let bounds = windowScene.coordinateSpace.bounds
+        return bounds.width > bounds.height
+    }
+    
+    // Add binding function
+    private func binding(for alarm: Alarm) -> Binding<Alarm> {
+        guard let index = state.alarms.firstIndex(where: { $0.id == alarm.id }) else {
+            fatalError("Alarm not found")
+        }
+        return $state.alarms[index]
+    }
+    
     var body: some View {
         NavigationView {
             if state.alarms.isEmpty {
@@ -514,7 +546,7 @@ struct ContentView: View {
 
 // Add a constant for max alarms
 extension ContentView {
-    static let maxAlarms = 3
+    static let maxAlarms = 1
 }
 
 // Create a new AlarmsView to hold the existing alarms list
@@ -873,6 +905,7 @@ struct StatusView: View {
     @ObservedObject var state: ContentView.ContentViewState
     @Environment(\.colorScheme) var colorScheme
     @Environment(\.scenePhase) var scenePhase
+    @Environment(\.horizontalSizeClass) var horizontalSizeClass
     @State private var showingAbout = false
     @State private var showingSnoozedDialog = false
     @State private var selectedSnoozedAlarm: Alarm?
@@ -880,6 +913,29 @@ struct StatusView: View {
     // Add timer to update countdown
     @State private var currentTime = Date()
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    
+    // Add computed property to determine if we should show stat cards
+    private var shouldShowStatCards: Bool {
+        // Get the current window scene
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+            return false
+        }
+        
+        // Get the current window bounds
+        let bounds = windowScene.coordinateSpace.bounds
+        
+        // Check if width is less than height (portrait)
+        return bounds.width < bounds.height
+    }
+    
+    // Add computed property for orientation
+    private var isLandscape: Bool {
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+            return false
+        }
+        let bounds = windowScene.coordinateSpace.bounds
+        return bounds.width > bounds.height
+    }
     
     // Add binding function
     private func binding(for alarm: Alarm) -> Binding<Alarm> {
@@ -918,82 +974,122 @@ struct StatusView: View {
             } else {
                 // Quick Status Card
                 Section {
-                    VStack(spacing: 16) {
-                        // Statistics Cards without NavigationLinks
-                        NavigationLink(destination: AlarmsView(state: state)) {
-                            HStack(spacing: 20) {
-                                StatCard(
-                                    title: "Total",
-                                    value: "\(state.alarms.count)",
-                                    icon: "bell.fill"
-                                )
-                                
-                                //                            StatCard(
-                                //                                title: "Active",
-                                //                                value: "\(state.alarms.filter { $0.isEnabled }.count)",
-                                //                                icon: "bell.badge.fill"
-                                //                            )
-                                
-                                StatCard(
-                                    title: "Snoozed",
-                                    value: "\(snoozedAlarms.count)",
-                                    icon: "zzz"
-                                )
-                            }
-                        }
-                    }
-                    .padding(.vertical, 8)
-                    
-                    // Next Alarm Card - Make it look like a button
-                    if let nextAlarm = nextScheduledAlarm {
-                        Group {
-                            if let snoozedUntil = nextAlarm.snoozedUntil,
-                               snoozedUntil > currentTime {
-                                // If next alarm is snoozed, show button that triggers snooze dialog
+                    if isLandscape {
+                        // Landscape layout
+                        HStack(spacing: 20) {
+                            // Only show StatCards in portrait mode
+                            if shouldShowStatCards {
                                 Button(action: {
-                                    selectedSnoozedAlarm = nextAlarm
-                                    showingSnoozedDialog = true
+                                    // Navigate programmatically
+                                    let alarmsView = AlarmsView(state: state)
+                                    let hostingController = UIHostingController(rootView: alarmsView)
+                                    if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                                       let window = windowScene.windows.first,
+                                       let rootVC = window.rootViewController as? UINavigationController {
+                                        rootVC.pushViewController(hostingController, animated: true)
+                                    }
                                 }) {
-                                    NextAlarmContent(alarm: nextAlarm, currentTime: currentTime)
+                                    HStack(spacing: 20) {
+                                        StatCard(
+                                            title: "Total",
+                                            value: "\(state.alarms.count)",
+                                            icon: "bell.fill"
+                                        )
+                                        
+                                        StatCard(
+                                            title: "Snoozed",
+                                            value: "\(snoozedAlarms.count)",
+                                            icon: "zzz"
+                                        )
+                                    }
                                 }
-                            } else {
-                                // If not snoozed, use NavigationLink to edit view
-                                NavigationLink(destination: AlarmEditView(
-                                    alarm: binding(for: nextAlarm),
-                                    isNew: false
-                                )) {
-                                    NextAlarmContent(alarm: nextAlarm, currentTime: currentTime)
+                                .buttonStyle(.plain)
+                            }
+                            
+                            // Next Alarm Card - Make it look like a button
+                            if let nextAlarm = nextScheduledAlarm {
+                                Group {
+                                    if let snoozedUntil = nextAlarm.snoozedUntil,
+                                       snoozedUntil > currentTime {
+                                        // If next alarm is snoozed, show button that triggers snooze dialog
+                                        Button(action: {
+                                            selectedSnoozedAlarm = nextAlarm
+                                            showingSnoozedDialog = true
+                                        }) {
+                                            NextAlarmContent(alarm: nextAlarm, currentTime: currentTime, isLandscape: true)
+                                        }
+                                    } else {
+                                        // If not snoozed, use NavigationLink to edit view
+                                        NavigationLink(destination: AlarmEditView(
+                                            alarm: binding(for: nextAlarm),
+                                            isNew: false
+                                        )) {
+                                            NextAlarmContent(alarm: nextAlarm, currentTime: currentTime, isLandscape: true)
+                                        }
+                                    }
                                 }
+                                .buttonStyle(.plain)
                             }
                         }
-                        .buttonStyle(PlainButtonStyle())
+                        .padding(.vertical, 8)
                     } else {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Next Alarm")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                            Text("No alarms set")
-                                .font(.title2)
-                                .foregroundColor(.secondary)
+                        // Portrait layout (existing code)
+                        VStack(spacing: 16) {
+                            // Only show StatCards in portrait mode
+                            if shouldShowStatCards {
+                                Button(action: {
+                                    // Navigate programmatically
+                                    let alarmsView = AlarmsView(state: state)
+                                    let hostingController = UIHostingController(rootView: alarmsView)
+                                    if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                                       let window = windowScene.windows.first,
+                                       let rootVC = window.rootViewController as? UINavigationController {
+                                        rootVC.pushViewController(hostingController, animated: true)
+                                    }
+                                }) {
+                                    HStack(spacing: 20) {
+                                        StatCard(
+                                            title: "Total",
+                                            value: "\(state.alarms.count)",
+                                            icon: "bell.fill"
+                                        )
+                                        
+                                        StatCard(
+                                            title: "Snoozed",
+                                            value: "\(snoozedAlarms.count)",
+                                            icon: "zzz"
+                                        )
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            
+                            // Next Alarm Card - Make it look like a button
+                            if let nextAlarm = nextScheduledAlarm {
+                                Group {
+                                    if let snoozedUntil = nextAlarm.snoozedUntil,
+                                       snoozedUntil > currentTime {
+                                        // If next alarm is snoozed, show button that triggers snooze dialog
+                                        Button(action: {
+                                            selectedSnoozedAlarm = nextAlarm
+                                            showingSnoozedDialog = true
+                                        }) {
+                                            NextAlarmContent(alarm: nextAlarm, currentTime: currentTime, isLandscape: false)
+                                        }
+                                    } else {
+                                        // If not snoozed, use NavigationLink to edit view
+                                        NavigationLink(destination: AlarmEditView(
+                                            alarm: binding(for: nextAlarm),
+                                            isNew: false
+                                        )) {
+                                            NextAlarmContent(alarm: nextAlarm, currentTime: currentTime, isLandscape: false)
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    
-                }
-
-                // Snoozed Alarms Section
-                if !snoozedAlarms.isEmpty {
-                    Section {
-                        HStack {
-                            Text("Snoozed")
-                                .font(.headline)
-                            Spacer()
-                        }
-                        
-                        ForEach(snoozedAlarms) { alarm in
-                            SnoozedAlarmRow(alarm: alarm, state: state)
-                                .padding(.vertical, 4)
-                        }
+                        .padding(.vertical, 8)
                     }
                 }
 
@@ -1017,7 +1113,7 @@ struct StatusView: View {
                                 ActiveAlarmRow(alarm: alarm)
                                     .padding(.vertical, 4)
                             }
-                            .buttonStyle(PlainButtonStyle())
+                            .buttonStyle(.plain)
                         }
                     }
                     
@@ -1045,13 +1141,24 @@ struct StatusView: View {
                 
             }
         }
-        .navigationTitle("Somnolence")
+        // .navigationTitle(isLandscape ? "" : "Somnolence")
+        .navigationBarTitleDisplayMode(.large)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarBackground(Color(.systemBackground), for: .navigationBar)
         .listStyle(.insetGrouped)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                if !isLandscape {
+                    Text("Somnolence")
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
+                }
+            }
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button(action: { showingAbout = true }) {
-                    Image(systemName: "info.circle")
-                        .foregroundColor(.blue)
+                if !isLandscape {
+                    Button(action: { showingAbout = true }) {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.blue)
+                    }
                 }
             }
         }
@@ -1138,7 +1245,7 @@ struct StatusView: View {
     
     private func getNextTriggerTime(for alarm: Alarm) -> Date {
         // If alarm is snoozed, use snooze time
-        if let snoozedUntil = alarm.snoozedUntil, snoozedUntil > currentTime {
+        if let snoozedUntil = alarm.snoozedUntil, snoozedUntil > Date() {
             return snoozedUntil
         }
         
@@ -1149,7 +1256,7 @@ struct StatusView: View {
         guard let nextAlarm = nextScheduledAlarm else { return "" }
         
         let targetDate: Date
-        if let snoozedUntil = nextAlarm.snoozedUntil, snoozedUntil > currentTime {
+        if let snoozedUntil = nextAlarm.snoozedUntil, snoozedUntil > Date() {
             targetDate = snoozedUntil
         } else {
             targetDate = nextOccurrence(for: nextAlarm)
@@ -1178,7 +1285,7 @@ struct StatusView: View {
         guard let nextAlarm = nextScheduledAlarm else { return .secondary }
         
         let targetDate: Date
-        if let snoozedUntil = nextAlarm.snoozedUntil, snoozedUntil > currentTime {
+        if let snoozedUntil = nextAlarm.snoozedUntil, snoozedUntil > Date() {
             targetDate = snoozedUntil
         } else {
             targetDate = nextOccurrence(for: nextAlarm)
@@ -1645,7 +1752,20 @@ struct AlarmEditView: View {
         NavigationView {
             Form {
                 Section {
-                    TextField("Alarm Name", text: $alarmName)
+                    VStack(alignment: .leading) {
+                        TextField("Alarm Name", text: $alarmName)
+                            .textInputAutocapitalization(.words)
+                            .autocorrectionDisabled()
+                            .textContentType(.none)
+                            .frame(maxWidth: .infinity)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .onChange(of: alarmName) { _, _ in
+                                // Limit name length to prevent layout issues
+                                if alarmName.count > 50 {
+                                    alarmName = String(alarmName.prefix(50))
+                                }
+                            }
+                    }
                 }
                 
                 Section {
@@ -1730,11 +1850,6 @@ struct AlarmEditView: View {
     }
     
     private func saveAlarm() {
-        // Cancel any existing notifications for this alarm
-        if !isNew {
-            ContentView.shared.cancelAlarm(alarm)
-        }
-        
         let updatedAlarm = Alarm(
             id: alarm.id,
             time: selectedTime,
@@ -1746,15 +1861,45 @@ struct AlarmEditView: View {
         )
         
         if isNew {
+            // For new alarms, add to shared state first
+            ContentView.shared.alarms.append(updatedAlarm)
+            ContentView.shared.saveAlarms()
+            ContentView.shared.scheduleAlarm(updatedAlarm)
+            
+            // Then notify through callback if provided
             onAdd?(updatedAlarm)
         } else {
+            // Update the local binding first
             alarm = updatedAlarm
-            // Update storage and reschedule
+            
+            // Then update storage and reschedule
             if let index = ContentView.shared.alarms.firstIndex(where: { $0.id == alarm.id }) {
+                // Update in storage first
                 ContentView.shared.alarms[index] = updatedAlarm
-                // Reschedule the alarm notifications
-                ContentView.shared.scheduleAlarm(updatedAlarm)
                 ContentView.shared.saveAlarms()
+                
+                // Then handle notifications
+                ContentView.shared.scheduleAlarm(updatedAlarm)
+                
+                // Schedule a check after 2 seconds to verify days are selected
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    if updatedAlarm.days.isEmpty {
+                        // Delete the alarm if no days are selected
+                        withAnimation {
+                            // First cancel any notifications
+                            ContentView.shared.cancelAlarm(updatedAlarm)
+                            
+                            // Then remove from storage
+                            if let index = ContentView.shared.alarms.firstIndex(where: { $0.id == updatedAlarm.id }) {
+                                ContentView.shared.alarms.remove(at: index)
+                                ContentView.shared.saveAlarms()
+                                
+                                // Force a refresh of the notification status
+                                ContentView.shared.refreshNotificationStatus()
+                            }
+                        }
+                    }
+                }
             }
         }
         dismiss()
@@ -2508,12 +2653,15 @@ extension String {
 struct NextAlarmContent: View {
     let alarm: Alarm
     let currentTime: Date
+    let isLandscape: Bool
     
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Next Alarm")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
+            if !isLandscape {
+                Text("Next Alarm")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
             Text(alarm.name)
                 .font(.system(size: 34, weight: .medium, design: .rounded))
             
@@ -2632,5 +2780,29 @@ struct NextAlarmContent: View {
         }
         
         return now
+    }
+}
+
+// Add helper view to remove NavigationLink chevron
+struct NavigationLinkRemoveChevron: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: .zero)
+        DispatchQueue.main.async {
+            if let parentCell = view.findParentListCell() {
+                parentCell.accessoryType = .none
+            }
+        }
+        return view
+    }
+    
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+extension UIView {
+    func findParentListCell() -> UITableViewCell? {
+        if let cell = self.superview as? UITableViewCell {
+            return cell
+        }
+        return superview?.findParentListCell()
     }
 }
