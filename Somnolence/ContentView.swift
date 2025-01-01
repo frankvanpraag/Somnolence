@@ -35,44 +35,82 @@ struct ContentView: View {
     
     class ContentViewState: ObservableObject {
         @Published var alarms: [Alarm] = []
-        private var lastPrintedAlarms: String? // Track last printed state
+        private var lastPendingNotifications: String? // Track last notification state
+        
+        // Add static helper function for day names
+        private static func dayName(_ weekday: Int) -> String {
+            let days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+            return days[weekday - 1]
+        }
         
         init() {
             loadAlarms()
         }
         
         func loadAlarms() {
-            // First load alarms from UserDefaults
             if let savedAlarms = UserDefaults.standard.data(forKey: "SavedAlarms"),
                let decodedAlarms = try? JSONDecoder().decode([Alarm].self, from: savedAlarms) {
                 self.alarms = decodedAlarms
                 
                 // Get pending notifications to cross-reference
                 UNUserNotificationCenter.current().getPendingNotificationRequests { requests in
-                    print("\n=== STORED ALARMS ===")
-                    // Print stored alarms
-                    for alarm in decodedAlarms {
-                        print("\nAlarm ID: \(alarm.id)")
-                        print("Name: \(alarm.name)")
-                        print("Time: \(self.formatDate(alarm.time))")
-                        print("Is Enabled: \(alarm.isEnabled)")
-                        print("Sound Name: \(alarm.soundName)")
-                        print("Days: \(Array(alarm.days).sorted())")
-                        print("Snoozed Until: \(alarm.snoozedUntil.map { self.formatDate($0) } ?? "None")")
-                        print("-----------------------------")
-                    }
+                    // Create a string representation of current notifications
+                    let currentNotifications = requests.compactMap { request -> String? in
+                        guard let alarmId = request.content.userInfo["alarmId"] as? String,
+                              let trigger = request.trigger as? UNCalendarNotificationTrigger,
+                              let nextTrigger = trigger.nextTriggerDate() else {
+                            return nil
+                        }
+                        
+                        return """
+                            id: \(alarmId)
+                            trigger: \(self.formatDate(nextTrigger))
+                            sound: \(request.content.userInfo["soundName"] as? String ?? "None")
+                            """
+                    }.joined(separator: "\n---\n")
                     
-                    // Print pending notifications
-                    print("\n=== PENDING NOTIFICATIONS ===")
-                    for request in requests {
-                        if let alarmId = request.content.userInfo["alarmId"] as? String {
-                            print("\nNotification for Alarm ID: \(alarmId)")
-                            if let trigger = request.trigger as? UNCalendarNotificationTrigger {
-                                print("Next trigger date: \(self.formatDate(trigger.nextTriggerDate() ?? Date()))")
+                    // Only print if notifications have changed
+                    if currentNotifications != self.lastPendingNotifications {
+                        print("\n=== PENDING NOTIFICATIONS CHANGED ===")
+                        print("\nTotal Notifications: \(requests.count)")
+                        print("Timestamp: \(self.formatDate(Date()))")
+                        print("\nNotifications by Day:")
+                        print("-----------------------------")
+                        
+                        // Group notifications by alarm ID
+                        let groupedRequests = Dictionary(grouping: requests) { request -> String in
+                            request.content.userInfo["alarmId"] as? String ?? "unknown"
+                        }
+                        
+                        for (alarmId, alarmRequests) in groupedRequests {
+                            if let firstRequest = alarmRequests.first {
+                                print("\nAlarm ID: \(alarmId)")
+                                print("Title: \(firstRequest.content.title)")
+                                print("Sound: \(firstRequest.content.userInfo["soundName"] as? String ?? "None")")
+                                print("Interruption Level: \(firstRequest.content.interruptionLevel.rawValue)")
+                                print("\nScheduled Times:")
                             }
-                            print("Sound: \(request.content.userInfo["soundName"] as? String ?? "None")")
+                            
+                            // Sort requests by next trigger date
+                            let sortedRequests = alarmRequests.compactMap { request -> (Int, Date)? in
+                                guard let trigger = request.trigger as? UNCalendarNotificationTrigger,
+                                      let nextTrigger = trigger.nextTriggerDate(),
+                                      let weekday = trigger.dateComponents.weekday else {
+                                    return nil
+                                }
+                                return (weekday, nextTrigger)
+                            }.sorted { $0.0 < $1.0 }
+                            
+                            // Print each day's trigger time
+                            for (weekday, triggerDate) in sortedRequests {
+                                let dayName = Self.dayName(weekday)
+                                print("  \(dayName.padRight(toLength: 10)): \(self.formatDate(triggerDate))")
+                            }
                             print("-----------------------------")
                         }
+                        
+                        // Update last known state
+                        self.lastPendingNotifications = currentNotifications
                     }
                 }
             } else {
@@ -133,18 +171,12 @@ struct ContentView: View {
                 
                 UNUserNotificationCenter.current().add(request) { error in
                     if let error = error {
-                        print("Error scheduling alarm for \(self.dayName(day)): \(error)")
+                        print("Error scheduling alarm for \(Self.dayName(day)): \(error)")
                     }
                 }
             }
             
             saveAlarms()
-        }
-        
-        // Helper function to get day name
-        private func dayName(_ weekday: Int) -> String {
-            let days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-            return days[weekday - 1]
         }
         
         func cancelAlarm(_ alarm: Alarm) {
@@ -792,18 +824,7 @@ struct StatusView: View {
         state.saveAlarms()
     }
     
-    private func getNextTriggerTime(for alarm: Alarm) -> Date {
-        // If alarm is snoozed, use snooze time
-        if let snoozedUntil = alarm.snoozedUntil, snoozedUntil > Date() {
-            return snoozedUntil
-        }
-        
-        return nextOccurrence(for: alarm)
-    }
-    
     private var nextScheduledAlarm: Alarm? {
-//        let now = Date()
-        
         // Filter to only enabled alarms
         let activeAlarms = state.alarms.filter { $0.isEnabled }
         
@@ -813,6 +834,15 @@ struct StatusView: View {
             let bTime = getNextTriggerTime(for: b)
             return aTime < bTime
         }
+    }
+    
+    private func getNextTriggerTime(for alarm: Alarm) -> Date {
+        // If alarm is snoozed, use snooze time
+        if let snoozedUntil = alarm.snoozedUntil, snoozedUntil > currentTime {
+            return snoozedUntil
+        }
+        
+        return nextOccurrence(for: alarm)
     }
     
     private var timeUntilNextAlarm: String {
@@ -2100,4 +2130,14 @@ struct InfoCard: View {
 
 #Preview {
     ContentView()
+}
+
+// String extension for padding
+extension String {
+    func padRight(toLength length: Int) -> String {
+        if self.count >= length {
+            return self
+        }
+        return self + String(repeating: " ", count: length - self.count)
+    }
 }
