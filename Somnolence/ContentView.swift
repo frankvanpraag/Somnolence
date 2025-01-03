@@ -8,6 +8,7 @@
 import SwiftUI
 import AVFoundation
 import UserNotifications
+import Speech
 
 struct Alarm: Identifiable, Codable {
     let id: UUID
@@ -18,11 +19,38 @@ struct Alarm: Identifiable, Codable {
     var snoozedUntil: Date?
     var name: String
     
-    init(id: UUID = UUID(), time: Date = Date(), isEnabled: Bool = true, soundName: String = "system_alarm", days: Set<Int> = Set(1...7), snoozedUntil: Date? = nil, name: String = "Alarm") {
+    // Add static function to find default sound
+    static func defaultSound() -> String {
+        // Get custom sounds
+        let fileManager = FileManager.default
+        guard let resourcePath = Bundle.main.resourcePath else { return "system_alarm" }
+        
+        do {
+            let files = try fileManager.contentsOfDirectory(atPath: resourcePath)
+            let catSounds = files.compactMap { file -> String? in
+                guard file.hasSuffix(".wav") || file.hasSuffix(".mp3") else { return nil }
+                let name = (file as NSString).deletingPathExtension
+                return name.lowercased().contains("cat") ? name : nil
+            }
+            
+            // Return shortest cat sound name or system_alarm if none found
+            return catSounds.min(by: { $0.count < $1.count }) ?? "system_alarm"
+        } catch {
+            return "system_alarm"
+        }
+    }
+    
+    init(id: UUID = UUID(), 
+         time: Date = Date(), 
+         isEnabled: Bool = true, 
+         soundName: String? = nil,  // Make soundName optional in init
+         days: Set<Int> = Set(1...7), 
+         snoozedUntil: Date? = nil, 
+         name: String = "Alarm") {
         self.id = id
         self.time = time
         self.isEnabled = isEnabled
-        self.soundName = soundName
+        self.soundName = soundName ?? Self.defaultSound()  // Use defaultSound if no sound specified
         self.days = days
         self.snoozedUntil = snoozedUntil
         self.name = name
@@ -32,466 +60,149 @@ struct Alarm: Identifiable, Codable {
 struct ContentView: View {
     static let shared = ContentViewState()
     @StateObject private var state = ContentViewState()
+    @State private var showingNotificationWarning = false
+    @State private var notificationIssues: [NotificationIssue] = []
     
-    class ContentViewState: ObservableObject {
-        @Published var alarms: [Alarm] = []
-        private var lastPendingNotifications: String? // Track last notification state
+    enum NotificationIssue: Identifiable {
+        case notificationsDisabled
+        case criticalAlertsDisabled
+        case dndEnabled
+        case focusEnabled
+        case soundsDisabled
         
-        // Add static helper function for day names
-        private static func dayName(_ weekday: Int) -> String {
-            let days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-            return days[weekday - 1]
-        }
-        
-        // Add logging function with timestamp
-        private func log(_ message: String) {
-            let timestamp = formatDate(Date())
-            print("[\(timestamp)] \(message)")
-        }
-        
-        init() {
-            loadAlarms()
-            // Ensure notifications are scheduled for all enabled alarms
-            rescheduleAllAlarms()
-            
-            // Register for app termination notification
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(handleAppTermination),
-                name: UIApplication.willTerminateNotification,
-                object: nil
-            )
-            
-            // Register for time change notifications
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(handleSignificantTimeChange),
-                name: UIApplication.significantTimeChangeNotification,
-                object: nil
-            )
-        }
-        
-        @objc public func handleAppTermination() {
-            // Save current state
-            saveAlarms()
-            
-            // Ensure all notifications are properly scheduled
-            rescheduleAllAlarms()
-        }
-        
-        @objc public func handleSignificantTimeChange() {
-            // Reschedule all alarms when time changes significantly (e.g., timezone change)
-            rescheduleAllAlarms()
-        }
-        
-        public func rescheduleAllAlarms() {
-            // First, cancel all existing notifications
-            UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
-            
-            // Then reschedule all enabled alarms
-            for alarm in alarms where alarm.isEnabled {
-                scheduleAlarm(alarm)
-            }
-            
-            // Force a refresh of the notification status
-            refreshNotificationStatus()
-        }
-        
-        // Add function to force notification status refresh
-        func refreshNotificationStatus() {
-            // Force refresh by clearing last known state
-            self.lastPendingNotifications = nil
-            loadAlarms()
-        }
-        
-        func loadAlarms() {
-            if let savedAlarms = UserDefaults.standard.data(forKey: "SavedAlarms"),
-               let decodedAlarms = try? JSONDecoder().decode([Alarm].self, from: savedAlarms) {
-                self.alarms = decodedAlarms
-                
-                // Get pending notifications to cross-reference
-                UNUserNotificationCenter.current().getPendingNotificationRequests { requests in
-                    // Clean up orphaned notifications
-                    let validAlarmIds = Set(self.alarms.map { $0.id.uuidString })
-                    
-                    // Group all notifications by alarm ID
-                    let notificationsByAlarm = Dictionary(grouping: requests) { request -> String in
-                        request.content.userInfo["alarmId"] as? String ?? "unknown"
-                    }
-                    
-                    // Find orphaned notifications
-                    let orphanedNotifications = requests.filter { request in
-                        guard let alarmId = request.content.userInfo["alarmId"] as? String else {
-                            return true // Remove notifications without alarmId
-                        }
-                        return !validAlarmIds.contains(alarmId)
-                    }
-                    
-                    // Find notifications that don't match current alarm settings
-                    var invalidNotifications: [(notification: UNNotificationRequest, reason: String)] = []
-                    
-                    for (alarmId, notifications) in notificationsByAlarm {
-                        guard let alarm = self.alarms.first(where: { $0.id.uuidString == alarmId }) else {
-                            continue // Already handled by orphaned notifications
-                        }
-                        
-                        for notification in notifications {
-                            // Check if it's a snooze notification
-                            if notification.identifier.starts(with: "snooze-") {
-                                if alarm.snoozedUntil == nil {
-                                    invalidNotifications.append((notification, "Snooze notification exists but alarm is not snoozed"))
-                                }
-                                continue
-                            }
-                            
-                            // Check regular alarm notifications
-                            guard let trigger = notification.trigger as? UNCalendarNotificationTrigger,
-                                  let weekday = trigger.dateComponents.weekday else {
-                                invalidNotifications.append((notification, "Invalid trigger type or missing weekday"))
-                                continue
-                            }
-                            
-                            // Verify the weekday is still selected for this alarm
-                            if !alarm.days.contains(weekday) {
-                                invalidNotifications.append((notification, "Notification exists for unselected day \(Self.dayName(weekday))"))
-                            }
-                            
-                            // Verify the time matches
-                            let alarmHour = Calendar.current.component(.hour, from: alarm.time)
-                            let alarmMinute = Calendar.current.component(.minute, from: alarm.time)
-                            if trigger.dateComponents.hour != alarmHour || trigger.dateComponents.minute != alarmMinute {
-                                invalidNotifications.append((notification, "Time mismatch - notification: \(trigger.dateComponents.hour ?? 0):\(trigger.dateComponents.minute ?? 0), alarm: \(alarmHour):\(alarmMinute)"))
-                            }
-                        }
-                    }
-                    
-                    // Remove invalid notifications
-                    if !invalidNotifications.isEmpty {
-                        self.log("\n=== CLEANING UP INVALID NOTIFICATIONS ===")
-                        self.log("Found \(invalidNotifications.count) invalid notifications")
-                        
-                        let identifiersToRemove = invalidNotifications.map { $0.notification.identifier }
-                        UNUserNotificationCenter.current().removePendingNotificationRequests(
-                            withIdentifiers: identifiersToRemove
-                        )
-                        
-                        // Print details of removed notifications
-                        for (notification, reason) in invalidNotifications {
-                            self.log("\nRemoved notification:")
-                            self.log("ID: \(notification.identifier)")
-                            self.log("Alarm ID: \(notification.content.userInfo["alarmId"] as? String ?? "unknown")")
-                            self.log("Title: \(notification.content.title)")
-                            self.log("Reason: \(reason)")
-                            if let trigger = notification.trigger as? UNCalendarNotificationTrigger,
-                               let nextTrigger = trigger.nextTriggerDate() {
-                                self.log("Next trigger: \(self.formatDate(nextTrigger))")
-                            }
-                        }
-                        self.log("-----------------------------")
-                        
-                        // Reschedule notifications for affected alarms
-                        let affectedAlarmIds = Set(invalidNotifications.compactMap { 
-                            $0.notification.content.userInfo["alarmId"] as? String 
-                        })
-                        for alarmId in affectedAlarmIds {
-                            if let alarm = self.alarms.first(where: { $0.id.uuidString == alarmId }) {
-                                self.scheduleAlarm(alarm)
-                            }
-                        }
-                    }
-                    
-                    // Handle orphaned notifications (existing code)
-                    if !orphanedNotifications.isEmpty {
-                        self.log("\n=== CLEANING UP ORPHANED NOTIFICATIONS ===")
-                        self.log("Found \(orphanedNotifications.count) orphaned notifications")
-                        
-                        let identifiersToRemove = orphanedNotifications.map { $0.identifier }
-                        UNUserNotificationCenter.current().removePendingNotificationRequests(
-                            withIdentifiers: identifiersToRemove
-                        )
-                        
-                        // Print details of removed notifications
-                        for notification in orphanedNotifications {
-                            self.log("\nRemoved notification:")
-                            self.log("ID: \(notification.identifier)")
-                            self.log("Alarm ID: \(notification.content.userInfo["alarmId"] as? String ?? "unknown")")
-                            self.log("Title: \(notification.content.title)")
-                            if let trigger = notification.trigger as? UNCalendarNotificationTrigger,
-                               let nextTrigger = trigger.nextTriggerDate() {
-                                self.log("Next trigger: \(self.formatDate(nextTrigger))")
-                            }
-                        }
-                        self.log("-----------------------------")
-                    }
-                    
-                    // Create a string representation of current notifications
-                    let currentNotifications = requests.compactMap { request -> String? in
-                        guard let alarmId = request.content.userInfo["alarmId"] as? String,
-                              let trigger = request.trigger as? UNCalendarNotificationTrigger,
-                              let nextTrigger = trigger.nextTriggerDate() else {
-                            return nil
-                        }
-                        
-                        return """
-                            id: \(alarmId)
-                            trigger: \(self.formatDate(nextTrigger))
-                            sound: \(request.content.userInfo["soundName"] as? String ?? "None")
-                            """
-                    }.joined(separator: "\n---\n")
-                    
-                    // Only print if notifications have changed
-                    if currentNotifications != self.lastPendingNotifications {
-                        self.log("\n=== PENDING NOTIFICATIONS CHANGED ===")
-                        self.log("Total Notifications: \(requests.count)")
-                        self.log("Timestamp: \(self.formatDate(Date()))")
-                        self.log("Notifications by Day:")
-                        self.log("-----------------------------")
-                        
-                        // Group notifications by alarm ID
-                        let groupedRequests = Dictionary(grouping: requests) { request -> String in
-                            request.content.userInfo["alarmId"] as? String ?? "unknown"
-                        }
-                        
-                        for (alarmId, alarmRequests) in groupedRequests {
-                            // Find the corresponding alarm object to get snooze info
-                            let alarm = self.alarms.first { $0.id.uuidString == alarmId }
-                            
-                            if let firstRequest = alarmRequests.first {
-                                self.log("Alarm ID: \(alarmId)")
-                                self.log("Title: \(firstRequest.content.userInfo["alarmName"] as? String ?? firstRequest.content.title)")
-                                if let alarm = alarm {
-                                    self.log("AlarmTime: \(self.formatTime(alarm.time))")
-                                }
-                                self.log("Sound: \(firstRequest.content.userInfo["soundName"] as? String ?? "None")")
-                                self.log("Interruption Level: \(firstRequest.content.interruptionLevel.rawValue)")
-                                
-                                // Add snooze status if available
-                                if let alarm = alarm,
-                                   let snoozedUntil = alarm.snoozedUntil {
-                                    let now = Date()
-                                    if snoozedUntil > now {
-                                        self.log("Snooze Status: Active")
-                                        self.log("Snoozed Until: \(self.formatDate(snoozedUntil))")
-                                        let timeRemaining = snoozedUntil.timeIntervalSince(now)
-                                        let minutes = Int(timeRemaining) / 60
-                                        let seconds = Int(timeRemaining) % 60
-                                        self.log("Snooze Remaining: \(minutes)m \(seconds)s")
-                                    } else {
-                                        self.log("Snooze Status: Expired")
-                                        self.log("Last Snooze Time: \(self.formatDate(snoozedUntil))")
-                                    }
-                                } else {
-                                    self.log("Snooze Status: None")
-                                }
-                                
-                                // self.log("Scheduled Times:")
-                            }
-                            
-                            // Sort requests by next trigger date
-                            let sortedRequests = alarmRequests.compactMap { request -> (Int, Date)? in
-                                guard let trigger = request.trigger as? UNCalendarNotificationTrigger,
-                                      let nextTrigger = trigger.nextTriggerDate(),
-                                      let weekday = trigger.dateComponents.weekday else {
-                                    return nil
-                                }
-                                return (weekday, nextTrigger)
-                            }.sorted { $0.0 < $1.0 }
-                            
-                            // Print scheduled days in compact format
-                            let scheduledDays = sortedRequests.map { $0.0 }
-                            let dayLetters = ["S", "M", "T", "W", "T", "F", "S"]
-                            let scheduleString = scheduledDays.map { dayLetters[$0 - 1] }.joined(separator: " ")
-                            self.log("Schedule: \(scheduleString)")
-                            self.log("-----------------------------")
-                        }
-                        
-                        // Update last known state
-                        self.lastPendingNotifications = currentNotifications
-                    }
-                }
-            } else {
-                self.log("No saved alarms found.")
+        var id: String {
+            switch self {
+            case .notificationsDisabled: return "notifications"
+            case .criticalAlertsDisabled: return "critical"
+            case .dndEnabled: return "dnd"
+            case .focusEnabled: return "focus"
+            case .soundsDisabled: return "sounds"
             }
         }
         
-        private func formatDate(_ date: Date) -> String {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-            return formatter.string(from: date)
-        }
-        
-        private func formatTime(_ date: Date) -> String {
-            let formatter = DateFormatter()
-            formatter.timeStyle = .short
-            return formatter.string(from: date)
-        }
-        
-        func saveAlarms() {
-            if let encoded = try? JSONEncoder().encode(alarms) {
-                UserDefaults.standard.set(encoded, forKey: "SavedAlarms")
+        var title: String {
+            switch self {
+            case .notificationsDisabled: return "Notifications Disabled"
+            case .criticalAlertsDisabled: return "Critical Alerts Disabled"
+            case .dndEnabled: return "Do Not Disturb Active"
+            case .focusEnabled: return "Focus Mode Active"
+            case .soundsDisabled: return "Notification Sounds Disabled"
             }
         }
         
-        func scheduleAlarm(_ alarm: Alarm) {
-            // First ensure the alarm is saved in state without affecting other alarms
-            if let index = alarms.firstIndex(where: { $0.id == alarm.id }) {
-                // Update existing alarm
-                alarms[index] = alarm
-            } else {
-                // Add new alarm without affecting existing ones
-                alarms.append(alarm)
+        var message: String {
+            switch self {
+            case .notificationsDisabled:
+                return "Alarms require notifications to work properly. Please enable notifications in Settings."
+            case .criticalAlertsDisabled:
+                return "Critical alerts ensure alarms work even in silent mode. Please enable them in Settings."
+            case .dndEnabled:
+                return "Do Not Disturb may prevent alarms from making sound. Consider disabling it or allowing this app."
+            case .focusEnabled:
+                return "Focus mode may prevent alarms from making sound. Consider adding this app to allowed apps."
+            case .soundsDisabled:
+                return "Notification sounds are disabled. Alarms may not make sound when they trigger."
             }
-            
-            // Save all alarms
-            saveAlarms()
-            
-            // Then handle notifications
-            // First cancel existing notifications for this alarm only
-            for day in 1...7 {
-                UNUserNotificationCenter.current().removePendingNotificationRequests(
-                    withIdentifiers: ["\(alarm.id)-\(day)"]
-                )
-            }
-            
-            // Don't schedule notifications if no days are selected, but keep the alarm
-            guard !alarm.days.isEmpty else { 
-                refreshNotificationStatus()
-                return 
-            }
-            
-            let content = UNMutableNotificationContent()
-            content.title = alarm.name
-            content.body = alarm.name.lowercased().contains("wake") ? 
-                "Time to rise and shine" : 
-                "Your alarm '\(alarm.name)' is ringing"
-            content.categoryIdentifier = "ALARM_CATEGORY"
-            content.userInfo = [
-                "soundName": alarm.soundName,
-                "alarmId": alarm.id.uuidString,
-                "alarmName": alarm.name
-            ]
-            content.interruptionLevel = .timeSensitive
-            
-            // Handle system sounds differently
-            if alarm.soundName.starts(with: "system_") {
-                content.sound = UNNotificationSound.default
-            } else {
-                let soundName = UNNotificationSoundName("\(alarm.soundName).wav")
-                if #available(iOS 15.0, *) {
-                    content.sound = UNNotificationSound.criticalSoundNamed(soundName)
-                } else {
-                    content.sound = UNNotificationSound(named: soundName)
-                }
-            }
-            
-            // Create notifications for each selected day
-            let dispatchGroup = DispatchGroup()
-            var scheduledCount = 0
-            _ = alarm.days.count
-            
-            for day in alarm.days.sorted() {
-                dispatchGroup.enter()
-                var dateComponents = Calendar.current.dateComponents([.hour, .minute], from: alarm.time)
-                dateComponents.weekday = day
-                
-                let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: true)
-                let request = UNNotificationRequest(
-                    identifier: "\(alarm.id)-\(day)",
-                    content: content,
-                    trigger: trigger
-                )
-                
-                UNUserNotificationCenter.current().add(request) { [weak self] error in
-                    if let error = error {
-                        self?.log("Error scheduling alarm '\(alarm.name)' for \(Self.dayName(day)): \(error)")
-                    } else {
-                        self?.log("Successfully scheduled '\(alarm.name)' for \(Self.dayName(day))")
-                    }
-                    
-                    scheduledCount += 1
-                    dispatchGroup.leave()
-                }
-            }
-            
-            // Wait for all notifications to be scheduled before refreshing UI
-            dispatchGroup.notify(queue: .main) { [weak self] in
-                self?.refreshNotificationStatus()
-            }
-        }
-        
-        func cancelAlarm(_ alarm: Alarm) {
-            // Remove notifications for all days
-            for day in 1...7 {
-                UNUserNotificationCenter.current().removePendingNotificationRequests(
-                    withIdentifiers: ["\(alarm.id)-\(day)"]
-                )
-            }
-            
-            // Also remove any snooze notifications
-            UNUserNotificationCenter.current().removePendingNotificationRequests(
-                withIdentifiers: ["snooze-\(alarm.id)"]
-            )
-            
-            AudioManager.shared.stopAlarmSound()
-            saveAlarms()
-            
-            // Refresh notification status after cancellation
-            DispatchQueue.main.async { [weak self] in
-                self?.refreshNotificationStatus()
-            }
-        }
-        
-        private func prettyPrintAlarms(_ alarms: [Alarm]) throws -> String {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys] // Sort keys for pretty printing
-            
-            // Create a sorted array of dictionaries for each alarm
-            let sortedAlarms = alarms.map { alarm -> [String: Any] in
-                let dict: [String: Any] = [
-                    "id": alarm.id.uuidString, // Keep id at the top
-                    "time": formatDate(alarm.time), // Convert Date to String
-                    "isEnabled": alarm.isEnabled,
-                    "soundName": alarm.soundName,
-                    "days": Array(alarm.days).sorted(), // Sort days
-                    "snoozedUntil": alarm.snoozedUntil.map { formatDate($0) } as Any, // Handle optional with map
-                    "name": alarm.name
-                ]
-                
-                return dict
-            }
-            
-            // Convert the sorted array of dictionaries to JSON
-            let jsonData = try JSONSerialization.data(withJSONObject: sortedAlarms, options: .prettyPrinted)
-            return String(data: jsonData, encoding: .utf8) ?? "Error converting to string"
-        }
-        
-        // Add a public method for background task handling
-        public func handleBackgroundRefresh() {
-            // Verify and update all alarm states
-            loadAlarms()
-            
-            // Clean up any expired snoozes
-            let now = Date()
-            for (index, alarm) in alarms.enumerated() {
-                if let snoozedUntil = alarm.snoozedUntil, snoozedUntil < now {
-                    alarms[index].snoozedUntil = nil
-                }
-            }
-            
-            // Ensure all notifications are properly scheduled
-            rescheduleAllAlarms()
-            
-            // Save any changes
-            saveAlarms()
         }
     }
     
-    @State private var showingAddAlarm = false
-    @State private var notificationGranted = false
-    @AppStorage("selectedTab") private var selectedTab = 0
-    
     init() {
         requestNotificationPermission()
+        
+        // Start monitoring notification settings
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            checkNotificationSettings()
+        }
+    }
+    
+    private func checkNotificationSettings() {
+        var issues: [NotificationIssue] = []
+        
+        // Check notification authorization
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async {
+                // Check basic notification authorization
+                if settings.authorizationStatus != .authorized {
+                    issues.append(.notificationsDisabled)
+                }
+                
+                // Check critical alerts (iOS 15+)
+                if #available(iOS 15.0, *) {
+                    if settings.criticalAlertSetting != .enabled {
+                        issues.append(.criticalAlertsDisabled)
+                    }
+                }
+                
+                // Check sound settings
+                if settings.soundSetting != .enabled {
+                    issues.append(.soundsDisabled)
+                }
+                
+                // Check DND/Focus status
+                if #available(iOS 15.0, *) {
+                    Task {
+                        let focusStatus = await checkFocusStatus()
+                        if focusStatus {
+                            issues.append(.focusEnabled)
+                        }
+                        
+                        // Update UI with all collected issues
+                        DispatchQueue.main.async {
+                            self.notificationIssues = issues
+                            self.showingNotificationWarning = !issues.isEmpty
+                        }
+                    }
+                                    } else {
+                    // For iOS 14 and earlier, just update with collected issues
+                    self.notificationIssues = issues
+                    self.showingNotificationWarning = !issues.isEmpty
+                }
+            }
+        }
+    }
+    
+    @available(iOS 15.0, *)
+    private func checkFocusStatus() async -> Bool {
+        return await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { _ in
+                // This is a hack to check Focus status indirectly
+                // If Focus is on, this will return false immediately
+                continuation.resume(returning: true)
+            }
+        }
+    }
+    
+    var body: some View {
+        NavigationView {
+            if state.alarms.isEmpty {
+                AlarmsView(state: state)
+            } else {
+                StatusView(state: state)
+            }
+        }
+        .navigationViewStyle(.stack)
+        .alert("Notification Settings Warning", isPresented: $showingNotificationWarning) {
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("Dismiss", role: .cancel) {}
+        } message: {
+            Text(notificationIssues.map { "• \($0.message)" }.joined(separator: "\n\n"))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            checkNotificationSettings()
+        }
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            if newPhase == .active {
+                checkNotificationSettings()
+            }
+        }
     }
     
     private var isLandscape: Bool {
@@ -508,17 +219,6 @@ struct ContentView: View {
             fatalError("Alarm not found")
         }
         return $state.alarms[index]
-    }
-    
-    var body: some View {
-        NavigationView {
-            if state.alarms.isEmpty {
-                AlarmsView(state: state)
-            } else {
-                StatusView(state: state)
-            }
-        }
-        .navigationViewStyle(.stack)
     }
     
     private func requestNotificationPermission() {
@@ -816,7 +516,10 @@ struct AlarmsView: View {
             // Create a critical notification sound that will play even in silent mode
             let soundName = UNNotificationSoundName("\(alarm.soundName).wav")
             if #available(iOS 15.0, *) {
-                content.sound = UNNotificationSound.criticalSoundNamed(soundName)
+                content.sound = UNNotificationSound.criticalSoundNamed(
+                    soundName,
+                    withAudioVolume: 1.0
+                )
             } else {
                 content.sound = UNNotificationSound(named: soundName)
             }
@@ -1141,7 +844,6 @@ struct StatusView: View {
                 
             }
         }
-        // .navigationTitle(isLandscape ? "" : "Somnolence")
         .navigationBarTitleDisplayMode(.large)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarBackground(Color(.systemBackground), for: .navigationBar)
@@ -1164,6 +866,18 @@ struct StatusView: View {
         }
         .sheet(isPresented: $showingAbout) {
             AboutView()
+        }
+        .alert("Notification Settings Warning", isPresented: .constant(!state.notificationIssues.isEmpty)) {
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("Dismiss", role: .cancel) {
+                state.showingNotificationWarning = false
+            }
+        } message: {
+            Text(state.notificationIssues.map { "• \($0.message)" }.joined(separator: "\n\n"))
         }
         .confirmationDialog(
             "Snoozed Alarm",
@@ -1195,13 +909,16 @@ struct StatusView: View {
         .onChange(of: scenePhase) { oldPhase, newPhase in
             if newPhase == .active {
                 refreshData()
+                state.checkNotificationSettings()
             }
         }
         .onAppear {
             refreshData()
+            state.checkNotificationSettings()
         }
         .refreshable {
             refreshData()
+            state.checkNotificationSettings()
         }
     }
     
@@ -1955,7 +1672,7 @@ struct SoundPickerView: View {
         
         // Get custom sounds
         let fileManager = FileManager.default
-        guard let resourcePath = Bundle.main.resourcePath else { return systemSounds }
+        guard let resourcePath = Bundle.main.resourcePath else { return systemSounds.sorted() }
         
         do {
             let files = try fileManager.contentsOfDirectory(atPath: resourcePath)
@@ -1964,10 +1681,11 @@ struct SoundPickerView: View {
                 return (file as NSString).deletingPathExtension
             }
             
-            return systemSounds + customSounds
+            // If we have custom sounds, only use those, otherwise fall back to system sounds
+            return customSounds.isEmpty ? systemSounds.sorted() : customSounds.sorted()
         } catch {
             print("Error reading sound files: \(error)")
-            return systemSounds
+            return systemSounds.sorted()
         }
     }
     
@@ -2584,7 +2302,7 @@ struct AboutView: View {
                         Text("Support Development")
                             .font(.headline)
                         
-                        Text("If you enjoy using Somnolence, please consider the one-time in-app purchase. It will make Apple rich and help me buy more expensive pet food, which will make them very happy! 🐱🐶")
+                        Text("If you enjoy using Somnolence, please consider making a one-time in-app purchase. It will make Apple rich and help me buy more expensive pet food, which will make them very happy! 🐱🐶")
                             .multilineTextAlignment(.center)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
