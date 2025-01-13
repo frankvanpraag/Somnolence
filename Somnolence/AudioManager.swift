@@ -10,6 +10,9 @@ class AudioManager {
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var originalVolume: Float?
     
+    // Add property to track if alarm is playing
+    private(set) var isPlayingAlarmSound: Bool = false
+    
     private init() {
         NotificationCenter.default.addObserver(
             self,
@@ -41,15 +44,33 @@ class AudioManager {
         
         switch type {
         case .began:
-            // Audio session interrupted, handle cleanup
-            stopAlarmSound()
+            // For previews, just stop immediately
+            if isPreviewMode {
+                stopAlarmSound()
+                return
+            }
+            
+            // For actual alarms, handle cleanup but try to resume
+            if !isPreviewMode {
+                // Only stop if this is a non-mixable interruption
+                if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+                    let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                    if !options.contains(.shouldResume) {
+                        stopAlarmSound()
+                    }
+                } else {
+                    stopAlarmSound()
+                }
+            }
         case .ended:
-            // Check if we should resume
-            if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
-                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-                if options.contains(.shouldResume) {
-                    // Resume audio session
-                    try? AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
+            // Only try to resume for actual alarms, not previews
+            if !isPreviewMode {
+                if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+                    let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                    if options.contains(.shouldResume) {
+                        // Resume audio session
+                        try? AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
+                    }
                 }
             }
         @unknown default:
@@ -71,26 +92,39 @@ class AudioManager {
             let audioSession = AVAudioSession.sharedInstance()
             
             if forPreview {
-                // For previews, use standard playback
+                // For previews, use standard playback that stops when app goes to background
                 try audioSession.setCategory(
                     .playback,
                     mode: .default,
-                    options: [.mixWithOthers]
+                    options: [.mixWithOthers, .duckOthers]
                 )
+                // Don't activate background audio for previews
+                try audioSession.setActive(true)
             } else {
-                // For actual alarms, use more aggressive settings
-                try audioSession.setCategory(
-                    .playback,
-                    mode: .default,
-                    options: [.duckOthers]
-                )
+                // For actual alarms, use critical interruption level
+                if #available(iOS 14.5, *) {
+                    try audioSession.setCategory(
+                        .playback,
+                        mode: .default,
+                        policy: .longFormAudio,
+                        options: [.duckOthers]
+                    )
+                } else {
+                    try audioSession.setCategory(
+                        .playback,
+                        mode: .default,
+                        options: [.duckOthers]
+                    )
+                }
+                
+                // Configure for background playback only for actual alarms
+                try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
                 
                 if #available(iOS 15.0, *) {
+                    // Request no interruptions from system alerts for actual alarms only
                     try audioSession.setPrefersNoInterruptionsFromSystemAlerts(true)
                 }
             }
-            
-            try audioSession.setActive(true)
         } catch {
             print("Failed to set up audio session: \(error)")
         }
@@ -133,8 +167,11 @@ class AudioManager {
     }
     
     func playAlarmSound(named soundName: String, isPreview: Bool = false) {
+        isPlayingAlarmSound = !isPreview  // Set to true only for actual alarms
+        
         isPreviewMode = isPreview
         
+        // Only start background task for actual alarms
         if !isPreview {
             startBackgroundTask()
         }
@@ -155,15 +192,18 @@ class AudioManager {
                 self?.systemSoundTimer = timer
             }
         } else {
+            // For preview, just play once
             AudioServicesPlaySystemSound(1005)
         }
         
+        // Only ensure maximum volume for actual alarms
         if !isPreview {
             ensureMaximumVolume()
         }
     }
     
     func stopAlarmSound() {
+        isPlayingAlarmSound = false
         // Stop audio player if active
         audioPlayer?.stop()
         audioPlayer = nil
@@ -204,18 +244,19 @@ class AudioManager {
             audioPlayer = try AVAudioPlayer(contentsOf: url)
             audioPlayer?.volume = isPreview ? previewVolume : 1.0
             
-            // Always loop for alarms, never for previews
+            // Only loop for actual alarms, never for previews
             audioPlayer?.numberOfLoops = isPreview ? 0 : -1
             
             audioPlayer?.prepareToPlay()
             audioPlayer?.play()
             
+            // Only ensure maximum volume for actual alarms
             if !isPreview {
                 ensureMaximumVolume()
             }
         } catch {
             print("Failed to play sound: \(error)")
-            // Fall back to system sound with loop
+            // Fall back to system sound
             playAlarmSound(named: "system_alarm", isPreview: isPreview)
         }
     }

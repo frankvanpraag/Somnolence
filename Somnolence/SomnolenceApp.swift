@@ -22,22 +22,69 @@ struct SomnolenceApp: App {
 }
 
 class AppDelegate: NSObject, UIApplicationDelegate {
-    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
-    private let backgroundTaskIdentifier = "com.somnolence.refresh"
+    private var isBackgroundTaskRegistered = false
     
-    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
-        // Set up notification delegate first
-        UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+    private func getBackgroundIdentifier(for task: String) -> String {
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.vanpraag.miso.Somnolence"
+        return "\(bundleId).\(task)"
+    }
+    
+    func application(_ application: UIApplication, willFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+        print("Registering background task scheduler in AppDelegate...")
         
-        // Initialize audio session
-        initializeAudioSession()
+        if #available(iOS 13.0, *) {
+            // Register both refresh and processing tasks
+            let tasks = ["refresh", "processing"]
+            
+            for task in tasks {
+                let identifier = getBackgroundIdentifier(for: task)
+                BGTaskScheduler.shared.register(
+                    forTaskWithIdentifier: identifier,
+                    using: nil
+                ) { task in
+                    if let refreshTask = task as? BGAppRefreshTask {
+                        self.handleBackgroundRefresh(refreshTask)
+                    } else if let processingTask = task as? BGProcessingTask {
+                        self.handleBackgroundProcessing(processingTask)
+                    }
+                }
+            }
+            
+            isBackgroundTaskRegistered = true
+            print("✅ Background task scheduler registered successfully")
+            
+            // Schedule initial tasks
+            self.scheduleBackgroundTasks()
+        }
         
-        // Register background task
-        registerBackgroundTask()
+        return true
+    }
+    
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Configure notification handling
+        let notificationCenter = UNUserNotificationCenter.current()
+        notificationCenter.delegate = NotificationDelegate.shared
         
-        // Handle launch from notification
-        if let notification = launchOptions?[.remoteNotification] as? [String: AnyObject] {
-            handleNotificationLaunch(notification)
+        // Request notification authorization
+        notificationCenter.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, error in
+            guard let self = self else { return }
+            
+            if granted {
+                print("✅ Notification permission granted")
+                // Only configure AlarmScheduler if background task is registered
+                DispatchQueue.main.async {
+                    if self.isBackgroundTaskRegistered {
+                        print("🔄 Configuring AlarmScheduler after successful registration")
+                        AlarmScheduler.shared.configure()
+                        // Initialize audio session after AlarmScheduler is configured
+                        self.initializeAudioSession()
+                    } else {
+                        print("⚠️ Cannot configure AlarmScheduler - background task not registered")
+                    }
+                }
+            } else if let error = error {
+                print("❌ Failed to get notification permission: \(error)")
+            }
         }
         
         return true
@@ -47,88 +94,100 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         do {
             let audioSession = AVAudioSession.sharedInstance()
             
-            // Configure for playback without mixing
+            // First deactivate the session to ensure clean configuration
+            try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+            
+            // Configure for alarm playback with high priority
             try audioSession.setCategory(
                 .playback,
                 mode: .default,
-                options: []
+                options: []  // Remove all options to avoid conflicts
             )
+            
+            // Configure audio routing for maximum volume
+            try audioSession.overrideOutputAudioPort(.speaker)
             
             // Set audio session to critical playback
             if #available(iOS 15.0, *) {
                 try audioSession.setPrefersNoInterruptionsFromSystemAlerts(true)
             }
             
-            // Activate the session after configuration
-            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+            // Finally activate the session
+            try audioSession.setActive(true)
+            
+            print("✅ Audio session configured successfully")
         } catch {
-            print("Failed to set up audio session: \(error.localizedDescription)")
+            print("❌ Failed to set up audio session: \(error)")
         }
     }
     
-    private func registerBackgroundTask() {
-        BGTaskScheduler.shared.register(
-            forTaskWithIdentifier: backgroundTaskIdentifier,
-            using: nil
-        ) { [weak self] task in
-            self?.handleBackgroundTask(task as! BGAppRefreshTask)
+    private func scheduleBackgroundTasks() {
+        let logger = DebugLogger.shared
+        logger.log("Attempting to schedule background tasks", type: .info)
+        
+        // Check if tasks are already scheduled
+        BGTaskScheduler.shared.getPendingTaskRequests { requests in
+            let refreshIdentifier = self.getBackgroundIdentifier(for: "refresh")
+            let processingIdentifier = self.getBackgroundIdentifier(for: "processing")
+            
+            let isRefreshScheduled = requests.contains { $0.identifier == refreshIdentifier }
+            let isProcessingScheduled = requests.contains { $0.identifier == processingIdentifier }
+            
+            if isRefreshScheduled {
+                logger.log("Refresh task is already scheduled", type: .info)
+            } else {
+                let refreshRequest = BGAppRefreshTaskRequest(identifier: refreshIdentifier)
+                refreshRequest.earliestBeginDate = Date(timeIntervalSinceNow: 60)
+                
+                do {
+                    try BGTaskScheduler.shared.submit(refreshRequest)
+                    logger.log("✅ Refresh task scheduled successfully", type: .info)
+                } catch {
+                    logger.logBackgroundTaskError(error, identifier: refreshRequest.identifier)
+                }
+            }
+            
+            if isProcessingScheduled {
+                logger.log("Processing task is already scheduled", type: .info)
+            } else {
+                let processingRequest = BGProcessingTaskRequest(identifier: processingIdentifier)
+                processingRequest.earliestBeginDate = Date(timeIntervalSinceNow: 60)
+                processingRequest.requiresNetworkConnectivity = false
+                processingRequest.requiresExternalPower = false
+                
+                do {
+                    try BGTaskScheduler.shared.submit(processingRequest)
+                    logger.log("✅ Processing task scheduled successfully", type: .info)
+                } catch {
+                    logger.logBackgroundTaskError(error, identifier: processingRequest.identifier)
+                }
+            }
         }
-        scheduleBackgroundTask()
     }
     
-    private func scheduleBackgroundTask() {
-        let request = BGAppRefreshTaskRequest(identifier: backgroundTaskIdentifier)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60) // 15 minutes
-        
-        do {
-            try BGTaskScheduler.shared.submit(request)
-        } catch {
-            print("Could not schedule background task: \(error)")
-        }
-    }
-    
-    private func handleBackgroundTask(_ task: BGAppRefreshTask) {
-        // Schedule the next background refresh
-        scheduleBackgroundTask()
-        
-        // Add task expiration handler
-        task.expirationHandler = { [weak self] in
-            self?.endBackgroundTask()
+    private func handleBackgroundRefresh(_ task: BGAppRefreshTask) {
+        // Handle refresh task
+        task.expirationHandler = {
+            // Clean up any unfinished tasks
         }
         
-        // Perform background refresh
-        ContentView.shared.handleBackgroundRefresh()
+        // Schedule next refresh
+        scheduleBackgroundTasks()
         
         // Mark task complete
         task.setTaskCompleted(success: true)
     }
     
-    func applicationDidEnterBackground(_ application: UIApplication) {
-        // Start background task
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask { [weak self] in
-            self?.endBackgroundTask()
+    private func handleBackgroundProcessing(_ task: BGProcessingTask) {
+        // Handle processing task
+        task.expirationHandler = {
+            // Clean up any unfinished tasks
         }
         
-        // Schedule next background refresh
-        scheduleBackgroundTask()
-    }
-    
-    func applicationWillTerminate(_ application: UIApplication) {
-        ContentView.shared.handleAppTermination()
-        endBackgroundTask()
-    }
-    
-    private func endBackgroundTask() {
-        if backgroundTaskID != .invalid {
-            UIApplication.shared.endBackgroundTask(backgroundTaskID)
-            backgroundTaskID = .invalid
-        }
-    }
-    
-    private func handleNotificationLaunch(_ notification: [String: AnyObject]) {
-        if let alarmId = notification["alarmId"] as? String,
-           let soundName = notification["soundName"] as? String {
-            NotificationDelegate.shared.showAlarmModal(soundName: soundName, alarmId: alarmId)
-        }
+        // Schedule next processing task
+        scheduleBackgroundTasks()
+        
+        // Mark task complete
+        task.setTaskCompleted(success: true)
     }
 }
